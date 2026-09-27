@@ -1,0 +1,77 @@
+name: ci
+on:
+  push: {branches: [main]}
+  pull_request:
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    defaults:
+      run: {working-directory: cexy-rust}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: {path: cexy-rust, fetch-depth: 0, persist-credentials: false}
+      # The shared spec and conformance cases live in cexy-api-spec, checked out next to this repo.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: {repository: cexyio/cexy-api-spec, path: cexy-api-spec, persist-credentials: false}
+      # dtolnay/rust-toolchain has no release tags; pinned to a master commit (2026-09-12).
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with: {toolchain: stable, components: "rustfmt, clippy"}
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with: {python-version: "3.12"}
+      - run: pip install pyyaml==6.0.2
+      - name: Generated code matches the spec (drift check)
+        run: python3 tools/generate.py --check
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --locked
+      - name: Docs build without warnings
+        run: cargo doc --no-deps --locked
+        env: {RUSTDOCFLAGS: -D warnings}
+      - name: Known vulnerabilities (cargo-audit, pinned)
+        run: |
+          cargo install cargo-audit --version 0.22.2 --locked
+          cargo audit
+      - name: Package contents
+        run: cargo package --list --locked
+      - name: No internal references
+        env:
+          SCAN_PATTERNS: ${{ secrets.SCAN_PATTERNS }}
+        run: |
+          printf '%s\n' "$SCAN_PATTERNS" > "$RUNNER_TEMP/scan-patterns.txt"
+          CEXY_SCAN_PATTERNS_FILE="$RUNNER_TEMP/scan-patterns.txt" python3 tools/scan_internal.py .
+      - name: Scanner matches cexy-api-spec
+        run: cmp tools/scan_internal.py ../cexy-api-spec/tools/scan_internal.py
+      - name: Secret scan (gitleaks 8.21.2, checksum-verified)
+        run: |
+          curl -sSfL -o "$RUNNER_TEMP/gitleaks.tgz" https://github.com/gitleaks/gitleaks/releases/download/v8.21.2/gitleaks_8.21.2_linux_x64.tar.gz
+          echo "5bc41815076e6ed6ef8fbecc9d9b75bcae31f39029ceb55da08086315316e3ba  $RUNNER_TEMP/gitleaks.tgz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/gitleaks.tgz" -C "$RUNNER_TEMP" gitleaks
+          "$RUNNER_TEMP/gitleaks" dir . --config .gitleaks.toml --no-banner --redact
+          "$RUNNER_TEMP/gitleaks" git . --config .gitleaks.toml --no-banner --redact
+
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The minimum supported Rust version (Cargo.toml rust-version) and current stable.
+        rust: ["1.94", stable]
+    defaults:
+      run: {working-directory: cexy-rust}
+    env:
+      CEXY_REQUIRE_SPEC: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: {path: cexy-rust, persist-credentials: false}
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: {repository: cexyio/cexy-api-spec, path: cexy-api-spec, persist-credentials: false}
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with: {toolchain: "${{ matrix.rust }}"}
+      - name: Unit, conformance and WebSocket tests (offline)
+        run: cargo test --locked

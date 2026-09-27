@@ -1,0 +1,16 @@
+title = "cexy repos"
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "cexy-api-key"
+description = "CEXY API key id"
+regex = '''ak_[A-Za-z0-9]{16,}'''
+keywords = ["ak_"]
+
+[allowlist]
+description = "Placeholders used in docs, examples and tests"
+regexes = ['''ak_your_key_here''', '''ak_test_key''', '''your_secret_here''', '''test_secret''']
+# Cargo build output (git-ignored; dependency metadata contains unrelated ak_ strings).
+paths = ['''(^|/)target/''']

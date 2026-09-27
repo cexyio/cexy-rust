@@ -1,0 +1,5 @@
+/target
+# local secrets (written as globs so the internal-reference scan stays clean)
+*.env
+*.env.*
+.DS_Store

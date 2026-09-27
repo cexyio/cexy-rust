@@ -1,0 +1,43 @@
+[package]
+name = "cexy"
+version = "0.1.0-dev.1"
+edition = "2024"
+rust-version = "1.94"
+description = "Official Rust SDK for the CEXY.io exchange API (REST + WebSocket)"
+license = "MIT"
+repository = "https://github.com/cexyio/cexy-rust"
+homepage = "https://cexy.io"
+documentation = "https://docs.rs/cexy"
+readme = "README.md"
+keywords = ["cexy", "exchange", "crypto", "trading", "api"]
+categories = ["api-bindings", "cryptography::cryptocurrencies"]
+include = ["src/*.rs", "Cargo.toml", "README.md", "CHANGELOG.md", "LICENSE"]
+
+[dependencies]
+chrono = { version = "0.4.45", default-features = false, features = ["serde", "std", "clock"] }
+futures-util = "0.3.34"
+rand = "0.10.3"
+rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "tls12"] }
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls-no-provider"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+thiserror = "2.0.21"
+tokio = { version = "1.53.1", features = ["rt", "macros", "time", "sync", "net"] }
+tokio-tungstenite = { version = "0.30.0", features = ["rustls-tls-webpki-roots"] }
+url = "2.5.8"
+uuid = { version = "1.26.1", features = ["v4"] }
+webpki-roots = "1.0.9"
+
+[dev-dependencies]
+rcgen = { version = "0.13", default-features = false, features = ["crypto", "ring"] }
+regex = "1.13.1"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+tokio = { version = "1.53.1", features = ["full"] }
+wiremock = "0.6.5"
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }

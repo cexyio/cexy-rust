@@ -1,0 +1,1327 @@
+//! The WebSocket client: heartbeat, liveness, subscriptions with local limits, automatic
+//! reconnect with re-auth and re-subscribe, and live order books.
+
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, Weak};
+use std::time::{Duration, Instant};
+
+use futures_util::{SinkExt, StreamExt};
+use serde::Deserialize;
+use serde_json::{Map, Value, json};
+use tokio::sync::{Notify, mpsc, oneshot};
+use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::http::HeaderValue;
+use url::Url;
+
+use crate::amount::Amount;
+use crate::client::{Client, check_secure_url};
+use crate::error::{Error, Result, WsError};
+use crate::models_gen::ErrorCode;
+use crate::orderbook::{BookSnapshot, LiveOrderBook};
+
+/// The production WebSocket endpoint.
+pub const DEFAULT_WEBSOCKET_URL: &str = "wss://api.cexy.io/api/v1/ws";
+
+/// The WebSocket protocol version this SDK was written for.
+pub const SUPPORTED_PROTOCOL_VERSION: i64 = 1;
+
+/// Channels that need [`WebSocket::auth`] with a session access token.
+pub const PRIVATE_CHANNELS: [&str; 5] =
+    ["orders", "balances", "deposits", "withdrawals", "account"];
+
+const MAX_CHANNEL_LENGTH: usize = 64;
+const MAX_FRAME_SIZE: usize = 4 << 20;
+
+const KNOWN_EVENT_TYPES: [&str; 14] = [
+    "ticker.update",
+    "orderbook.update",
+    "trade.new",
+    "market.status",
+    "order.created",
+    "order.updated",
+    "order.cancelled",
+    "order.filled",
+    "balance.updated",
+    "deposit.detected",
+    "deposit.updated",
+    "deposit.completed",
+    "withdrawal.updated",
+    "session.revoked",
+];
+
+/// The server's first frame on every connection.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct Welcome {
+    /// Protocol version of the server.
+    #[serde(default)]
+    pub protocol_version: i64,
+    /// The server's own pong cadence (30), not a client deadline.
+    #[serde(default)]
+    pub heartbeat_interval_seconds: i64,
+    /// The server's subscription cap.
+    #[serde(default)]
+    pub max_subscriptions: i64,
+    /// Connection id, for support requests.
+    #[serde(default)]
+    pub connection_id: String,
+}
+
+/// A channel event such as `ticker.update`, `orderbook.update` or `order.filled`. Decode `data`
+/// with [`WsFrame::decode`]. Unknown event types are ignored (they may be added without notice).
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct WsFrame {
+    /// Event type.
+    #[serde(rename = "type")]
+    pub r#type: String,
+    /// Channel, such as `ticker:BTC/USDT`.
+    #[serde(default)]
+    pub channel: String,
+    /// Per channel, +1 per update. Resets per connection and when the server restarts.
+    #[serde(default)]
+    pub sequence: Option<i64>,
+    /// Server time of the event.
+    #[serde(default)]
+    pub timestamp: Option<String>,
+    /// The payload.
+    #[serde(default)]
+    pub data: Value,
+}
+
+impl WsFrame {
+    /// Decodes `data`, for example into [`OrderBookUpdate`] or [`crate::Order`].
+    pub fn decode<T: serde::de::DeserializeOwned>(&self) -> Result<T> {
+        serde_json::from_value(self.data.clone())
+            .map_err(|e| Error::Decode(format!("{}: {e}", self.r#type)))
+    }
+}
+
+/// The data of `orderbook.update`: always the complete top 50 levels of both sides (`full` is
+/// always true). It replaces the previous book; there are no deltas.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct OrderBookUpdate {
+    /// Market.
+    #[serde(default)]
+    pub symbol: String,
+    /// Always true.
+    #[serde(default)]
+    pub full: bool,
+    /// Bids, best first.
+    #[serde(default)]
+    pub bids: Vec<Vec<Amount>>,
+    /// Asks, best first.
+    #[serde(default)]
+    pub asks: Vec<Vec<Amount>>,
+}
+
+/// The data of `session.revoked` on the account channel.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct SessionRevoked {
+    /// The revoked session, if one.
+    #[serde(default)]
+    pub session_id: Option<String>,
+    /// Why.
+    #[serde(default)]
+    pub reason: String,
+    /// Whether it is this connection's session.
+    #[serde(default)]
+    pub current: bool,
+}
+
+/// A closed connection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CloseInfo {
+    /// WebSocket close code (4000 for a liveness timeout).
+    pub code: u16,
+    /// Close reason.
+    pub reason: String,
+    /// Whether the client reconnects.
+    pub will_reconnect: bool,
+}
+
+/// What [`WebSocket::subscribe`] did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SubscribeResult {
+    /// Channels the server confirmed as newly added.
+    pub added: Vec<String>,
+    /// Channels refused locally because the subscription cap was reached.
+    pub refused: Vec<String>,
+    /// Channels already held (nothing was sent for them).
+    pub already_subscribed: Vec<String>,
+}
+
+/// What [`WebSocket::auth`] did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AuthResult {
+    /// From the authenticated acknowledgement; `None` when queued.
+    pub user_id: Option<String>,
+    /// True when not connected: the token is kept and sent (and acknowledged) on connect.
+    pub queued: bool,
+}
+
+/// Why state may have been missed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResyncReason {
+    /// The server dropped messages (`CONCURRENT_MODIFICATION` without a request id).
+    ConcurrentModification,
+    /// The connection was re-established.
+    Reconnect,
+}
+
+/// A live order book changed state.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub enum BookEvent {
+    /// A snapshot or an update was applied.
+    Updated(BookSnapshot),
+    /// A sequence gap: the book is stale until the next update replaces it.
+    Stale {
+        /// Market.
+        symbol: String,
+        /// Expected sequence.
+        expected: i64,
+        /// Received sequence.
+        received: i64,
+    },
+    /// The update after a gap arrived in order; the book is current again.
+    Healed {
+        /// Market.
+        symbol: String,
+    },
+    /// A fresh REST snapshot is being taken (reconnect, `CONCURRENT_MODIFICATION`).
+    Resync {
+        /// Market.
+        symbol: String,
+    },
+    /// A snapshot failed; it is retried with backoff.
+    SnapshotFailed {
+        /// Market.
+        symbol: String,
+        /// What failed.
+        message: String,
+    },
+}
+
+/// Everything the WebSocket reports, in order. Read them from [`WebSocket::events`].
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum WsEvent {
+    /// A welcome frame (every connection).
+    Welcome(Welcome),
+    /// A known channel event.
+    Event(WsFrame),
+    /// Channels the server confirmed.
+    Subscribed(Vec<String>),
+    /// Channels the server removed.
+    Unsubscribed(Vec<String>),
+    /// The authenticated acknowledgement (after `auth` or the re-auth on reconnect).
+    Authenticated {
+        /// The user id.
+        user_id: Option<String>,
+    },
+    /// A pong; `id` is `None` for the server's own pongs.
+    Pong {
+        /// The id of the ping it answers.
+        id: Option<String>,
+    },
+    /// An error frame from the server.
+    ServerError(WsError),
+    /// A transport problem, or a failed automatic re-subscription or re-authentication.
+    Error(Error),
+    /// Something to know that is not an error (a newer protocol version, the subscription cap).
+    Warning(String),
+    /// The connection closed.
+    Close(CloseInfo),
+    /// A reconnect attempt is scheduled.
+    Reconnecting {
+        /// 1 for the first attempt.
+        attempt: u32,
+        /// Delay before it.
+        delay: Duration,
+    },
+    /// Reconnected (re-authentication and re-subscription follow automatically).
+    Reconnected(Welcome),
+    /// State may have been missed: refetch anything you keep from private or public channels.
+    Resync(ResyncReason),
+    /// `session.revoked` arrived: private channels are dead. The socket stays open and public
+    /// channels keep working. Call `auth` with a new token to restore private channels.
+    AuthLost(WsFrame),
+    /// A live order book changed state.
+    Book(BookEvent),
+}
+
+/// The receiving end of the event channel.
+pub type WsEvents = mpsc::Receiver<WsEvent>;
+
+/// Configures a [`WebSocket`].
+#[derive(Debug, Clone)]
+pub struct WsOptions {
+    /// Default [`DEFAULT_WEBSOCKET_URL`]. Must be `wss://` (see `allow_insecure`).
+    pub url: Option<String>,
+    /// Allow `ws://`, but ONLY for localhost, 127.0.0.1 or ::1 (local test servers).
+    pub allow_insecure: bool,
+    /// Client ping cadence, required by the server. Default 30 s.
+    pub ping_interval: Duration,
+    /// Reconnect when no frame arrives for this long. Default 75 s.
+    pub liveness_timeout: Duration,
+    /// How long to wait for the welcome frame. Default 10 s.
+    pub welcome_timeout: Duration,
+    /// How long `subscribe`, `unsubscribe`, `auth` and `ping` wait for the acknowledgement.
+    /// Default 5 s.
+    pub ack_timeout: Duration,
+    /// Reconnect automatically after a drop. Default true.
+    pub reconnect: bool,
+    /// Reconnect backoff: full jitter from this (default 1 s), doubling up to
+    /// `reconnect_max_delay` (default 30 s).
+    pub reconnect_base_delay: Duration,
+    /// See `reconnect_base_delay`.
+    pub reconnect_max_delay: Duration,
+    /// 0 means unlimited.
+    pub max_reconnect_attempts: u32,
+    /// Local subscription cap. Default 100 (the server's limit).
+    pub max_subscriptions: usize,
+    /// Local cap on client messages per fixed minute. Default 200 (the server closes above 240).
+    pub max_messages_per_minute: u32,
+    /// Sent as the User-Agent of the handshake. `Client::websocket` sets the SDK's.
+    pub user_agent: Option<String>,
+    /// Capacity of the event channel. When it is full (events not read), further events are
+    /// dropped and counted in [`WebSocket::dropped_events`]; live order books still update.
+    /// Default 10 000.
+    pub event_buffer: usize,
+}
+
+impl Default for WsOptions {
+    fn default() -> Self {
+        WsOptions {
+            url: None,
+            allow_insecure: false,
+            ping_interval: Duration::from_secs(30),
+            liveness_timeout: Duration::from_secs(75),
+            welcome_timeout: Duration::from_secs(10),
+            ack_timeout: Duration::from_secs(5),
+            reconnect: true,
+            reconnect_base_delay: Duration::from_secs(1),
+            reconnect_max_delay: Duration::from_secs(30),
+            max_reconnect_attempts: 0,
+            max_subscriptions: 100,
+            max_messages_per_minute: 200,
+            user_agent: None,
+            event_buffer: 10_000,
+        }
+    }
+}
+
+struct Pending {
+    kind: &'static str,
+    channels: Vec<String>,
+    tx: oneshot::Sender<std::result::Result<Value, WsError>>,
+}
+
+#[derive(Default)]
+pub(crate) struct State {
+    out: Option<mpsc::UnboundedSender<Message>>,
+    stop: Option<oneshot::Sender<()>>,
+    conn_gen: u64,
+    welcome: Option<Welcome>,
+    channels: Vec<String>,
+    pub(crate) token: Option<String>,
+    pending: HashMap<String, Pending>,
+    next_id: u64,
+    closed_by_user: bool,
+    ever_connected: bool,
+    reconnecting: bool,
+    window_start: Option<Instant>,
+    window_count: u32,
+    warned_version: bool,
+    books: HashMap<String, LiveOrderBook>,
+}
+
+pub(crate) struct Inner {
+    url: String,
+    opts: WsOptions,
+    pub(crate) snapshots: Option<Client>,
+    pub(crate) st: Mutex<State>,
+    events: mpsc::Sender<WsEvent>,
+    events_rx: Mutex<Option<WsEvents>>,
+    dropped: AtomicU64,
+    connect_lock: tokio::sync::Mutex<()>,
+    closing: Notify,
+}
+
+/// The CEXY.io WebSocket client. Cloning is cheap; clones share the connection.
+///
+/// API-key authentication on the WebSocket is not available yet: [`WebSocket::auth`] takes a
+/// session access token. Programs holding only an API key get public channels and poll REST for
+/// private state.
+#[derive(Clone)]
+pub struct WebSocket {
+    pub(crate) inner: Arc<Inner>,
+}
+
+impl std::fmt::Debug for WebSocket {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "cexy::WebSocket({})", self.inner.url)
+    }
+}
+
+impl Client {
+    /// A WebSocket client for the same deployment, wired to this client for order-book
+    /// snapshots. An unset `options.url` is derived from the base URL.
+    pub fn websocket(&self, mut options: WsOptions) -> Result<WebSocket> {
+        if options.url.is_none() {
+            let base = &self.t.base_url;
+            let ws = if let Some(rest) = base.strip_prefix("https") {
+                format!("wss{rest}")
+            } else {
+                format!("ws{}", base.strip_prefix("http").unwrap_or(base))
+            };
+            options.url = Some(format!("{ws}/api/v1/ws"));
+        }
+        options.allow_insecure |= self.t.allow_insecure;
+        if options.user_agent.is_none() {
+            options.user_agent = Some(self.t.user_agent.clone());
+        }
+        WebSocket::build(options, Some(self.clone()))
+    }
+}
+
+impl WebSocket {
+    /// Checks the options. Call [`WebSocket::connect`] to open the connection.
+    pub fn new(options: WsOptions) -> Result<WebSocket> {
+        WebSocket::build(options, None)
+    }
+
+    fn build(mut opts: WsOptions, snapshots: Option<Client>) -> Result<WebSocket> {
+        let url = opts
+            .url
+            .clone()
+            .unwrap_or_else(|| DEFAULT_WEBSOCKET_URL.to_string());
+        let u = Url::parse(&url)
+            .map_err(|_| Error::config(format!("invalid WebSocket URL: {url:?}")))?;
+        if u.host_str().is_none_or(str::is_empty) {
+            return Err(Error::config(format!("invalid WebSocket URL: {url:?}")));
+        }
+        check_secure_url(&u, "wss", "ws", opts.allow_insecure, "WebSocket URL")?;
+        // Credentials never go in a URL (userinfo), and the endpoint takes no query string:
+        // either would end up in logs and proxies.
+        if !u.username().is_empty() || u.password().is_some() {
+            return Err(Error::config(
+                "WebSocket URL must not contain credentials (user:password@)",
+            ));
+        }
+        if u.query().is_some() || u.fragment().is_some() {
+            return Err(Error::config(
+                "WebSocket URL must not contain a query string or fragment",
+            ));
+        }
+        if opts
+            .user_agent
+            .as_deref()
+            .is_some_and(|s| s.contains(['\r', '\n']))
+        {
+            return Err(Error::config("user_agent must not contain line breaks"));
+        }
+        let d = WsOptions::default();
+        for (v, dv) in [
+            (&mut opts.ping_interval, d.ping_interval),
+            (&mut opts.liveness_timeout, d.liveness_timeout),
+            (&mut opts.welcome_timeout, d.welcome_timeout),
+            (&mut opts.ack_timeout, d.ack_timeout),
+            (&mut opts.reconnect_base_delay, d.reconnect_base_delay),
+            (&mut opts.reconnect_max_delay, d.reconnect_max_delay),
+        ] {
+            if v.is_zero() {
+                *v = dv;
+            }
+        }
+        if opts.max_subscriptions == 0 {
+            opts.max_subscriptions = d.max_subscriptions;
+        }
+        if opts.max_messages_per_minute == 0 {
+            opts.max_messages_per_minute = d.max_messages_per_minute;
+        }
+        let (tx, rx) = mpsc::channel(opts.event_buffer.max(1));
+        let st = State {
+            closed_by_user: true,
+            next_id: 1,
+            ..Default::default()
+        };
+        Ok(WebSocket {
+            inner: Arc::new(Inner {
+                url,
+                opts,
+                snapshots,
+                st: Mutex::new(st),
+                events: tx,
+                events_rx: Mutex::new(Some(rx)),
+                dropped: AtomicU64::new(0),
+                connect_lock: tokio::sync::Mutex::new(()),
+                closing: Notify::new(),
+            }),
+        })
+    }
+
+    /// The event receiver (once; later calls return `None`). Read it continuously: when its
+    /// buffer is full, new events are dropped.
+    pub fn events(&self) -> Option<WsEvents> {
+        self.inner.events_rx.lock().unwrap().take()
+    }
+
+    /// Events dropped because the event channel was full.
+    pub fn dropped_events(&self) -> u64 {
+        self.inner.dropped.load(Ordering::Relaxed)
+    }
+
+    /// The WebSocket URL.
+    pub fn url(&self) -> &str {
+        &self.inner.url
+    }
+
+    /// The last welcome frame, or `None` while not connected.
+    pub fn welcome(&self) -> Option<Welcome> {
+        self.inner.st.lock().unwrap().welcome.clone()
+    }
+
+    /// Whether the connection is open and welcomed.
+    pub fn is_connected(&self) -> bool {
+        let s = self.inner.st.lock().unwrap();
+        s.out.is_some() && s.welcome.is_some()
+    }
+
+    /// The channels currently held (restored after every reconnect).
+    pub fn channels(&self) -> Vec<String> {
+        self.inner.st.lock().unwrap().channels.clone()
+    }
+
+    /// Opens the connection and returns the server's welcome frame. After it succeeds, dropped
+    /// connections are reopened automatically until [`WebSocket::close`] (unless `reconnect` is
+    /// false).
+    pub async fn connect(&self) -> Result<Welcome> {
+        let _g = self.inner.connect_lock.lock().await;
+        {
+            let mut s = self.inner.st.lock().unwrap();
+            if s.out.is_some()
+                && let Some(w) = &s.welcome
+            {
+                return Ok(w.clone());
+            }
+            s.closed_by_user = false;
+        }
+        Inner::open(&self.inner).await
+    }
+
+    /// Authenticates private channels with a session access token. It returns on the server's
+    /// `authenticated` acknowledgement; it fails on an error frame with the request id (the
+    /// token is then forgotten) or when no acknowledgement arrives within `ack_timeout`. The
+    /// token is kept in memory and re-sent after each reconnect. When not connected, the token
+    /// is queued (`queued` is true). API-key authentication is not available on the WebSocket
+    /// yet.
+    pub async fn auth(&self, token: &str) -> Result<AuthResult> {
+        if token.is_empty() {
+            return Err(WsError::local("CONFIG", "auth: token is required").into());
+        }
+        let connected = {
+            let mut s = self.inner.st.lock().unwrap();
+            s.token = Some(token.to_string());
+            s.out.is_some() && s.welcome.is_some()
+        };
+        if !connected {
+            return Ok(AuthResult {
+                user_id: None,
+                queued: true,
+            });
+        }
+        Inner::auth(&self.inner, token).await
+    }
+
+    /// Sends a ping with an id and returns the round-trip time.
+    pub async fn ping(&self) -> Result<Duration> {
+        let start = Instant::now();
+        Inner::request(&self.inner, "ping", Map::new(), vec![], true).await?;
+        Ok(start.elapsed())
+    }
+
+    /// Subscribes to channels such as `"ticker:BTC/USDT"` and `"trades:BTC/USDT"`, and returns
+    /// when the server confirms. Channels beyond `max_subscriptions` are refused locally. When
+    /// not connected, channels are queued and subscribed on connect.
+    pub async fn subscribe(&self, channels: &[&str]) -> Result<SubscribeResult> {
+        let wanted = uniq(channels.iter().map(|c| c.to_string()));
+        if let Some(bad) = wanted
+            .iter()
+            .find(|c| c.is_empty() || c.len() > MAX_CHANNEL_LENGTH)
+        {
+            return Err(WsError::local("CONFIG", format!("invalid channel name: {bad:?}")).into());
+        }
+        let mut res = SubscribeResult::default();
+        let (accepted, connected) = {
+            let mut s = self.inner.st.lock().unwrap();
+            let mut fresh = vec![];
+            for c in wanted {
+                if s.channels.contains(&c) {
+                    res.already_subscribed.push(c);
+                } else {
+                    fresh.push(c);
+                }
+            }
+            let room = self
+                .inner
+                .opts
+                .max_subscriptions
+                .saturating_sub(s.channels.len());
+            let accepted: Vec<String> = fresh.iter().take(room).cloned().collect();
+            res.refused = fresh[accepted.len()..].to_vec();
+            s.channels.extend(accepted.iter().cloned());
+            (accepted, s.out.is_some() && s.welcome.is_some())
+        };
+        if !res.refused.is_empty() {
+            self.inner.emit(WsEvent::Warning(format!(
+                "subscription cap of {} reached; refused {:?}",
+                self.inner.opts.max_subscriptions, res.refused
+            )));
+        }
+        if accepted.is_empty() || !connected {
+            return Ok(res);
+        }
+        res.added = Inner::send_subscribe(&self.inner, accepted).await?;
+        Ok(res)
+    }
+
+    /// Unsubscribes and returns on the `unsubscribed` acknowledgement (or after `ack_timeout`
+    /// without one); it fails on an error frame with the request id.
+    pub async fn unsubscribe(&self, channels: &[&str]) -> Result<()> {
+        Inner::unsubscribe(
+            &self.inner,
+            channels.iter().map(|c| c.to_string()).collect(),
+        )
+        .await
+    }
+
+    /// A live order book for `symbol` that follows the sync rules: subscribe first, then take a
+    /// REST snapshot (sequence S); drop updates with sequence <= S; each update replaces the
+    /// top 50 levels; a gap marks the book stale until the next update; a fresh snapshot after
+    /// every reconnect and after `CONCURRENT_MODIFICATION`. It returns after the first snapshot
+    /// and needs a WebSocket made by [`Client::websocket`].
+    pub async fn order_book(&self, symbol: &str) -> Result<LiveOrderBook> {
+        if self.inner.snapshots.is_none() {
+            return Err(WsError::local(
+                "CONFIG",
+                "order_book needs a WebSocket made by Client::websocket",
+            )
+            .into());
+        }
+        let book = {
+            let mut s = self.inner.st.lock().unwrap();
+            if let Some(b) = s.books.get(symbol) {
+                return Ok(b.clone());
+            }
+            let b = LiveOrderBook::new(symbol, Arc::downgrade(&self.inner));
+            s.books.insert(symbol.to_string(), b.clone());
+            b
+        };
+        let channel = format!("orderbook:{symbol}");
+        // Subscribe BEFORE the snapshot; updates are buffered until it arrives.
+        let mut result = self.subscribe(&[&channel]).await;
+        if let Ok(r) = &result
+            && !r.refused.is_empty()
+        {
+            result = Err(WsError::local(
+                "LOCAL_SUBSCRIPTION_LIMIT",
+                format!("cannot subscribe to {channel}: cap reached"),
+            )
+            .into());
+        }
+        let result = match result {
+            Ok(_) => book.initial_sync().await,
+            Err(e) => Err(e),
+        };
+        if let Err(e) = result {
+            self.inner.st.lock().unwrap().books.remove(symbol);
+            book.mark_closed();
+            let _ = self.unsubscribe(&[&channel]).await;
+            return Err(e);
+        }
+        Ok(book)
+    }
+
+    /// Closes the connection for good (no reconnect).
+    pub async fn close(&self) {
+        Inner::close(&self.inner);
+    }
+}
+
+impl Inner {
+    pub(crate) fn emit(&self, ev: WsEvent) {
+        if let Err(mpsc::error::TrySendError::Full(_)) = self.events.try_send(ev) {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn emit_error(&self, e: Error) {
+        // Requests cut short by a disconnect are redone by the reconnect.
+        if let Error::WebSocket(w) = &e
+            && (w.code == "DISCONNECTED" || w.code == "CLOSED")
+        {
+            return;
+        }
+        self.emit(WsEvent::Error(e));
+    }
+
+    async fn open(this: &Arc<Inner>) -> Result<Welcome> {
+        let mut req = this
+            .url
+            .as_str()
+            .into_client_request()
+            .map_err(|e| Error::config(format!("WebSocket URL: {e}")))?;
+        if let Some(ua) = &this.opts.user_agent {
+            let v = HeaderValue::from_str(ua).map_err(|_| Error::config("invalid User-Agent"))?;
+            req.headers_mut().insert("user-agent", v);
+        }
+        let mut cfg = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default();
+        cfg.max_message_size = Some(MAX_FRAME_SIZE);
+        cfg.max_frame_size = Some(MAX_FRAME_SIZE);
+        let welcome_timeout = this.opts.welcome_timeout;
+        let handshake = async {
+            // tungstenite does not follow redirects: a 3xx fails the handshake.
+            let connector = tokio_tungstenite::Connector::Rustls(crate::tls::client_config());
+            let (mut stream, _) = tokio_tungstenite::connect_async_tls_with_config(
+                req,
+                Some(cfg),
+                false,
+                Some(connector),
+            )
+            .await
+            .map_err(|e| {
+                WsError::local(
+                    "CONNECT_FAILED",
+                    format!("could not connect to {}: {e}", this.url),
+                )
+            })?;
+            let mut early = vec![];
+            loop {
+                let msg = match stream.next().await {
+                    Some(Ok(m)) => m,
+                    Some(Err(e)) => {
+                        return Err(WsError::local(
+                            "CONNECT_FAILED",
+                            format!("connection closed before welcome: {e}"),
+                        ));
+                    }
+                    None => {
+                        return Err(WsError::local(
+                            "CONNECT_FAILED",
+                            "connection closed before welcome",
+                        ));
+                    }
+                };
+                let Some(frame) = parse_frame(&msg) else {
+                    continue;
+                };
+                if frame.get("type").and_then(Value::as_str) == Some("welcome") {
+                    let welcome: Welcome =
+                        serde_json::from_value(Value::Object(frame)).unwrap_or(Welcome {
+                            protocol_version: 0,
+                            heartbeat_interval_seconds: 0,
+                            max_subscriptions: 0,
+                            connection_id: String::new(),
+                        });
+                    return Ok((stream, welcome, early));
+                }
+                early.push(frame);
+            }
+        };
+        let (stream, welcome, early) = match tokio::time::timeout(welcome_timeout, handshake).await
+        {
+            Ok(r) => r?,
+            Err(_) => return Err(WsError::local("TIMEOUT", "no welcome frame from server").into()),
+        };
+
+        let (out_tx, out_rx) = mpsc::unbounded_channel();
+        let (stop_tx, stop_rx) = oneshot::channel();
+        let generation = {
+            let mut s = this.st.lock().unwrap();
+            if s.closed_by_user {
+                None
+            } else {
+                s.conn_gen += 1;
+                s.out = Some(out_tx);
+                s.stop = Some(stop_tx);
+                s.welcome = Some(welcome.clone());
+                s.window_start = None;
+                s.window_count = 0;
+                Some(s.conn_gen)
+            }
+        };
+        let Some(generation) = generation else {
+            let (mut sink, _) = stream.split();
+            let _ = sink.send(Message::Close(None)).await;
+            return Err(WsError::local("CLOSED", "connection closed by client").into());
+        };
+        tokio::spawn(run_connection(
+            Arc::downgrade(this),
+            stream,
+            out_rx,
+            stop_rx,
+            generation,
+            this.opts.clone(),
+        ));
+        for f in early {
+            Inner::on_frame(this, f);
+        }
+        Inner::on_welcome(this, welcome.clone());
+        Ok(welcome)
+    }
+
+    fn on_welcome(this: &Arc<Inner>, welcome: Welcome) {
+        let (is_reconnect, token, channels, books, warn) = {
+            let mut s = this.st.lock().unwrap();
+            let warn = welcome.protocol_version != SUPPORTED_PROTOCOL_VERSION && !s.warned_version;
+            if warn {
+                s.warned_version = true;
+            }
+            let r = s.ever_connected;
+            s.ever_connected = true;
+            (
+                r,
+                s.token.clone(),
+                s.channels.clone(),
+                s.books.values().cloned().collect::<Vec<_>>(),
+                warn,
+            )
+        };
+        if warn {
+            this.emit(WsEvent::Warning(format!(
+                "server WebSocket protocol_version {} differs from the {SUPPORTED_PROTOCOL_VERSION} this SDK supports; continuing",
+                welcome.protocol_version
+            )));
+        }
+        this.emit(WsEvent::Welcome(welcome.clone()));
+        if token.is_some() || !channels.is_empty() {
+            let inner = this.clone();
+            tokio::spawn(async move {
+                if let Some(t) = token
+                    && let Err(e) = Inner::auth(&inner, &t).await
+                {
+                    inner.emit_error(e);
+                }
+                if !channels.is_empty()
+                    && let Err(e) = Inner::send_subscribe(&inner, channels).await
+                {
+                    inner.emit_error(e);
+                }
+            });
+        }
+        if is_reconnect {
+            this.emit(WsEvent::Reconnected(welcome));
+            this.emit(WsEvent::Resync(ResyncReason::Reconnect));
+            for b in books {
+                b.spawn_resync(0);
+            }
+        }
+    }
+
+    async fn auth(this: &Arc<Inner>, token: &str) -> Result<AuthResult> {
+        let mut payload = Map::new();
+        payload.insert("token".into(), Value::String(token.to_string()));
+        match Inner::request(this, "auth", payload, vec![], true).await {
+            Ok(ack) => Ok(AuthResult {
+                user_id: ack
+                    .get("user_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                queued: false,
+            }),
+            Err(e) => {
+                if let Error::WebSocket(w) = &e
+                    && w.from_server
+                {
+                    let mut s = this.st.lock().unwrap();
+                    if s.token.as_deref() == Some(token) {
+                        s.token = None; // the server refused it: do not resend on reconnect
+                    }
+                }
+                Err(e)
+            }
+        }
+    }
+
+    async fn send_subscribe(this: &Arc<Inner>, channels: Vec<String>) -> Result<Vec<String>> {
+        let mut payload = Map::new();
+        payload.insert("channels".into(), json!(channels));
+        // `subscribed` is sent only when something was added: silence means nothing new.
+        let ack = Inner::request(this, "subscribe", payload, channels, false).await?;
+        Ok(string_list(ack.get("channels")))
+    }
+
+    async fn unsubscribe(this: &Arc<Inner>, channels: Vec<String>) -> Result<()> {
+        let (held, connected) = {
+            let mut s = this.st.lock().unwrap();
+            let mut held = vec![];
+            for c in uniq(channels) {
+                if let Some(i) = s.channels.iter().position(|x| x == &c) {
+                    s.channels.remove(i);
+                    held.push(c);
+                }
+            }
+            (held, s.out.is_some() && s.welcome.is_some())
+        };
+        if held.is_empty() || !connected {
+            return Ok(());
+        }
+        let mut payload = Map::new();
+        payload.insert("channels".into(), json!(held));
+        Inner::request(this, "unsubscribe", payload, held, false)
+            .await
+            .map(|_| ())
+    }
+
+    /// Sends `{op, id, ...payload}` and waits for the acknowledgement with the same id, or an
+    /// error frame with that id. With `strict`, no acknowledgement within `ack_timeout` is an
+    /// error; otherwise it returns an empty object.
+    async fn request(
+        this: &Arc<Inner>,
+        kind: &'static str,
+        mut payload: Map<String, Value>,
+        channels: Vec<String>,
+        strict: bool,
+    ) -> Result<Map<String, Value>> {
+        let (tx, rx) = oneshot::channel();
+        let id = {
+            let mut s = this.st.lock().unwrap();
+            let id = s.next_id.to_string();
+            s.next_id += 1;
+            s.pending.insert(id.clone(), Pending { kind, channels, tx });
+            id
+        };
+        payload.insert("op".into(), Value::String(kind.to_string()));
+        payload.insert("id".into(), Value::String(id.clone()));
+        if let Err(e) = this.send(Value::Object(payload)) {
+            this.st.lock().unwrap().pending.remove(&id);
+            return Err(e.into());
+        }
+        match tokio::time::timeout(this.opts.ack_timeout, rx).await {
+            Ok(Ok(Ok(Value::Object(m)))) => Ok(m),
+            Ok(Ok(Ok(_))) => Ok(Map::new()),
+            Ok(Ok(Err(e))) => Err(e.into()),
+            Ok(Err(_)) => Err(WsError::local("DISCONNECTED", "connection lost").into()),
+            Err(_) => {
+                this.st.lock().unwrap().pending.remove(&id);
+                if strict {
+                    let ack = match kind {
+                        "auth" => "authenticated",
+                        "subscribe" => "subscribed",
+                        "unsubscribe" => "unsubscribed",
+                        _ => "pong",
+                    };
+                    Err(WsError::local(
+                        "TIMEOUT",
+                        format!("no {ack} acknowledgement for {kind} (id {id})"),
+                    )
+                    .into())
+                } else {
+                    Ok(Map::new())
+                }
+            }
+        }
+    }
+
+    fn send(&self, frame: Value) -> std::result::Result<(), WsError> {
+        let is_ping = frame.get("op").and_then(Value::as_str) == Some("ping");
+        let text = frame.to_string();
+        let mut s = self.st.lock().unwrap();
+        let Some(out) = s.out.clone() else {
+            return Err(WsError::local(
+                "NOT_CONNECTED",
+                "WebSocket is not connected",
+            ));
+        };
+        let now = Instant::now();
+        if s.window_start
+            .is_none_or(|w| now.duration_since(w) >= Duration::from_secs(60))
+        {
+            s.window_start = Some(now);
+            s.window_count = 0;
+        }
+        // Pings are never refused locally: without them the server closes the connection.
+        if !is_ping && s.window_count >= self.opts.max_messages_per_minute {
+            return Err(WsError::local(
+                "LOCAL_RATE_LIMIT",
+                format!(
+                    "more than {} messages this minute; the server closes the socket above 240",
+                    self.opts.max_messages_per_minute
+                ),
+            ));
+        }
+        s.window_count += 1;
+        drop(s);
+        out.send(Message::text(text))
+            .map_err(|_| WsError::local("NOT_CONNECTED", "WebSocket is not connected"))
+    }
+
+    fn settle(&self, id: &str, kind: Option<&str>, result: std::result::Result<Value, WsError>) {
+        let p = {
+            let mut s = self.st.lock().unwrap();
+            match s.pending.get(id) {
+                Some(p) if kind.is_none_or(|k| k == p.kind) => s.pending.remove(id),
+                _ => None,
+            }
+        };
+        if let Some(p) = p {
+            let _ = p.tx.send(result);
+        }
+    }
+
+    fn settle_by_channel(&self, kind: &str, channels: &[String], frame: Value) {
+        let p = {
+            let mut s = self.st.lock().unwrap();
+            let id = s
+                .pending
+                .iter()
+                .find(|(_, p)| p.kind == kind && p.channels.iter().any(|c| channels.contains(c)))
+                .map(|(id, _)| id.clone());
+            id.and_then(|id| s.pending.remove(&id))
+        };
+        if let Some(p) = p {
+            let _ = p.tx.send(Ok(frame));
+        }
+    }
+
+    fn on_frame(this: &Arc<Inner>, frame: Map<String, Value>) {
+        let typ = frame
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let id = frame.get("id").and_then(Value::as_str).map(str::to_string);
+        let value = Value::Object(frame.clone());
+        match typ.as_str() {
+            "welcome" => {
+                if let Ok(w) = serde_json::from_value::<Welcome>(value) {
+                    this.st.lock().unwrap().welcome = Some(w.clone());
+                    Inner::on_welcome(this, w);
+                }
+            }
+            "pong" => {
+                // Replies to our pings echo the id; the server's own pongs every 30 s have none.
+                if let Some(id) = &id {
+                    this.settle(id, Some("ping"), Ok(value));
+                }
+                this.emit(WsEvent::Pong { id });
+            }
+            "authenticated" => {
+                if let Some(id) = &id {
+                    this.settle(id, Some("auth"), Ok(value));
+                }
+                let user_id = frame
+                    .get("user_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                this.emit(WsEvent::Authenticated { user_id });
+            }
+            "subscribed" | "unsubscribed" => {
+                let channels = string_list(frame.get("channels"));
+                let kind = if typ == "subscribed" {
+                    "subscribe"
+                } else {
+                    "unsubscribe"
+                };
+                match &id {
+                    Some(id) => this.settle(id, Some(kind), Ok(value)),
+                    None => this.settle_by_channel(kind, &channels, value), // acks that carry no id
+                }
+                this.emit(if typ == "subscribed" {
+                    WsEvent::Subscribed(channels)
+                } else {
+                    WsEvent::Unsubscribed(channels)
+                });
+            }
+            "error" => {
+                let code = frame
+                    .get("code")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("UNKNOWN");
+                let message = frame
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(code);
+                let err = WsError {
+                    code: code.to_string(),
+                    message: message.to_string(),
+                    from_server: true,
+                };
+                if let Some(id) = &id {
+                    this.settle(id, None, Err(err.clone()));
+                }
+                this.emit(WsEvent::ServerError(err));
+                if code == ErrorCode::ConcurrentModification.as_str() && id.is_none() {
+                    // The server dropped messages: resynchronise every book and channel.
+                    this.emit(WsEvent::Resync(ResyncReason::ConcurrentModification));
+                    let books: Vec<_> = this.st.lock().unwrap().books.values().cloned().collect();
+                    for b in books {
+                        b.spawn_resync(0);
+                    }
+                }
+            }
+            t if KNOWN_EVENT_TYPES.contains(&t) => {
+                let Ok(ev) = serde_json::from_value::<WsFrame>(value) else {
+                    return;
+                };
+                if ev.r#type == "session.revoked" {
+                    {
+                        let mut s = this.st.lock().unwrap();
+                        s.token = None;
+                        s.channels
+                            .retain(|c| !PRIVATE_CHANNELS.contains(&c.as_str()));
+                    }
+                    this.emit(WsEvent::AuthLost(ev.clone()));
+                }
+                if ev.r#type == "orderbook.update" {
+                    let symbol = match ev.channel.strip_prefix("orderbook:") {
+                        Some(s) => s.to_string(),
+                        None => ev
+                            .decode::<OrderBookUpdate>()
+                            .map(|d| d.symbol)
+                            .unwrap_or_default(),
+                    };
+                    let book = this.st.lock().unwrap().books.get(&symbol).cloned();
+                    if let Some(b) = book {
+                        b.on_update(&ev);
+                    }
+                }
+                this.emit(WsEvent::Event(ev));
+            }
+            _ => {} // unknown frame types are ignored
+        }
+    }
+
+    fn on_dropped(this: &Arc<Inner>, generation: u64, code: u16, reason: String) {
+        let (books, will_reconnect, start) = {
+            let mut s = this.st.lock().unwrap();
+            if generation != s.conn_gen || s.out.is_none() {
+                return;
+            }
+            Inner::teardown(
+                &mut s,
+                WsError::local("DISCONNECTED", format!("connection lost (code {code})")),
+            );
+            let will = !s.closed_by_user && this.opts.reconnect;
+            let start = will && !s.reconnecting;
+            if start {
+                s.reconnecting = true;
+            }
+            (s.books.values().cloned().collect::<Vec<_>>(), will, start)
+        };
+        for b in books {
+            b.mark_disconnected(); // sequences reset per connection
+        }
+        this.emit(WsEvent::Close(CloseInfo {
+            code,
+            reason,
+            will_reconnect,
+        }));
+        if start {
+            tokio::spawn(Inner::reconnect_loop(this.clone()));
+        }
+    }
+
+    async fn reconnect_loop(this: Arc<Inner>) {
+        let mut attempt = 0u32;
+        loop {
+            attempt += 1;
+            if this.opts.max_reconnect_attempts > 0 && attempt > this.opts.max_reconnect_attempts {
+                this.emit_error(
+                    WsError::local(
+                        "RECONNECT_FAILED",
+                        format!(
+                            "gave up after {} reconnect attempts",
+                            this.opts.max_reconnect_attempts
+                        ),
+                    )
+                    .into(),
+                );
+                break;
+            }
+            let base = this.opts.reconnect_base_delay.as_secs_f64()
+                * 2f64.powi((attempt - 1).min(30) as i32);
+            let capped = base.min(this.opts.reconnect_max_delay.as_secs_f64());
+            let delay = Duration::from_secs_f64(rand::random::<f64>() * capped); // full jitter
+            this.emit(WsEvent::Reconnecting { attempt, delay });
+            tokio::select! {
+                _ = tokio::time::sleep(delay) => {}
+                _ = this.closing.notified() => break,
+            }
+            if this.st.lock().unwrap().closed_by_user {
+                break;
+            }
+            match Inner::open(&this).await {
+                Ok(_) => break,
+                Err(e) => {
+                    if this.st.lock().unwrap().closed_by_user {
+                        break;
+                    }
+                    this.emit_error(e);
+                }
+            }
+        }
+        this.st.lock().unwrap().reconnecting = false;
+    }
+
+    fn teardown(s: &mut State, err: WsError) {
+        if let Some(stop) = s.stop.take() {
+            let _ = stop.send(());
+        }
+        s.out = None;
+        s.welcome = None;
+        for (_, p) in s.pending.drain() {
+            let _ = p.tx.send(Err(err.clone()));
+        }
+    }
+
+    fn close(this: &Arc<Inner>) {
+        let (books, was_open) = {
+            let mut s = this.st.lock().unwrap();
+            if s.closed_by_user && s.out.is_none() {
+                return;
+            }
+            s.closed_by_user = true;
+            let was_open = s.out.is_some();
+            Inner::teardown(
+                &mut s,
+                WsError::local("CLOSED", "connection closed by client"),
+            );
+            (s.books.values().cloned().collect::<Vec<_>>(), was_open)
+        };
+        this.closing.notify_waiters();
+        for b in books {
+            b.mark_disconnected();
+        }
+        if was_open {
+            this.emit(WsEvent::Close(CloseInfo {
+                code: 1000,
+                reason: "client closing".into(),
+                will_reconnect: false,
+            }));
+        }
+    }
+
+    pub(crate) fn remove_book(&self, symbol: &str, book: &LiveOrderBook) {
+        let mut s = self.st.lock().unwrap();
+        if s.books.get(symbol).is_some_and(|b| b.same(book)) {
+            s.books.remove(symbol);
+        }
+    }
+
+    pub(crate) fn unsubscribe_later(this: &Arc<Inner>, channel: String) {
+        let inner = this.clone();
+        tokio::spawn(async move {
+            let _ = Inner::unsubscribe(&inner, vec![channel]).await;
+        });
+    }
+}
+
+async fn run_connection(
+    inner: Weak<Inner>,
+    stream: tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    mut out: mpsc::UnboundedReceiver<Message>,
+    mut stop: oneshot::Receiver<()>,
+    generation: u64,
+    opts: WsOptions,
+) {
+    let (mut sink, mut read) = stream.split();
+    let mut ping = tokio::time::interval_at(
+        tokio::time::Instant::now() + opts.ping_interval,
+        opts.ping_interval,
+    );
+    // One deadline for the whole connection, pushed back only when a frame arrives. (A
+    // per-read timeout would restart on every select! pass, e.g. on each outgoing ping, and
+    // so never fire while the client keeps pinging a silent server.)
+    let liveness = tokio::time::sleep(opts.liveness_timeout);
+    tokio::pin!(liveness);
+    let (code, reason) = loop {
+        tokio::select! {
+            _ = &mut stop => {
+                let _ = sink.send(Message::Close(None)).await;
+                return;
+            }
+            msg = out.recv() => match msg {
+                Some(m) => {
+                    if let Err(e) = sink.send(m).await {
+                        break (1006, e.to_string());
+                    }
+                }
+                None => {
+                    let _ = sink.send(Message::Close(None)).await;
+                    return;
+                }
+            },
+            _ = ping.tick() => {
+                // A dead socket is handled by the reader.
+                if let Some(i) = inner.upgrade() {
+                    let _ = i.send(json!({"op": "ping"}));
+                }
+            }
+            _ = &mut liveness => break (4000, "liveness timeout".to_string()),
+            r = read.next() => {
+                liveness
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + opts.liveness_timeout);
+                match r {
+                    None => break (1006, "connection closed".to_string()),
+                    Some(Err(e)) => break (1006, e.to_string()),
+                    Some(Ok(Message::Close(frame))) => {
+                        let (c, r) = frame
+                            .map(|f| (u16::from(f.code), f.reason.to_string()))
+                            .unwrap_or((1005, String::new()));
+                        break (c, r);
+                    }
+                    Some(Ok(m)) => {
+                        let Some(i) = inner.upgrade() else { return };
+                        if let Some(frame) = parse_frame(&m) {
+                            Inner::on_frame(&i, frame);
+                        }
+                    }
+                }
+            }
+        }
+    };
+    if let Some(i) = inner.upgrade() {
+        Inner::on_dropped(&i, generation, code, reason);
+    }
+}
+
+fn parse_frame(m: &Message) -> Option<Map<String, Value>> {
+    let text = match m {
+        Message::Text(t) => t.as_str(),
+        Message::Binary(b) => std::str::from_utf8(b).ok()?,
+        _ => return None,
+    };
+    match serde_json::from_str::<Value>(text) {
+        Ok(Value::Object(m)) => Some(m),
+        _ => None,
+    }
+}
+
+fn string_list(v: Option<&Value>) -> Vec<String> {
+    v.and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn uniq(it: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut out: Vec<String> = vec![];
+    for s in it {
+        if !out.contains(&s) {
+            out.push(s);
+        }
+    }
+    out
+}
