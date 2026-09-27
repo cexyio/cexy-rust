@@ -6,6 +6,16 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-dev.2] (2026-09-27)
+
+### Fixed
+- **Every REST call panicked in a normal project** ("http2 feature is not enabled"). The client
+  advertises HTTP/2 over TLS (ALPN `h2`), and api.cexy.io selects it, but reqwest was built without
+  its `http2` feature. The SDK's own tests passed only because a dev-dependency enabled the
+  feature. reqwest's `http2` feature is now enabled, and CI builds and runs a separate consumer crate
+  (`ci/consumer`) with no dev-dependencies, plus a check that hyper's `http2` feature is on in a
+  normal build. **0.1.0-dev.1 is unusable against the live API; use 0.1.0-dev.2.**
+
 ## [0.1.0-dev.1] (2026-09-27)
 
 First pre-release. Built from `openapi.sdk.json` (spec `info.version` 1.0.0), including cancel-all v2.

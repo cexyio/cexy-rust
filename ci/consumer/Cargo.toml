@@ -1,0 +1,14 @@
+# A crate that depends on cexy the way a user's project does: no cexy dev-dependencies, so
+# their features cannot mask a missing one (0.1.0-dev.1 advertised h2 without reqwest's
+# http2 feature; the SDK's own tests passed only because a dev-dependency enabled it).
+[package]
+name = "cexy-consumer-check"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+cexy = { path = "../.." }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+
+[workspace]

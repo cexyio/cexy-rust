@@ -59,6 +59,11 @@ jobs:
         run: |
           printf '%s\n' "$SCAN_PATTERNS" > "$RUNNER_TEMP/scan-patterns.txt"
           CEXY_SCAN_PATTERNS_FILE="$RUNNER_TEMP/scan-patterns.txt" python3 tools/scan_internal.py .
+      - name: Builds as a dependency (no dev-dependency features; ALPN h2 needs reqwest http2)
+        run: |
+          cargo tree -e features -i hyper --edges normal | grep -q 'hyper feature "http2"'
+          cargo build --manifest-path ci/consumer/Cargo.toml
+          cargo run --manifest-path ci/consumer/Cargo.toml
       - name: Package (and print the file list and checksum)
         run: |
           cargo package --locked
