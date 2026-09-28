@@ -28,6 +28,14 @@ url = "2.5.8"
 uuid = { version = "1.26.1", features = ["v4"] }
 webpki-roots = "1.0.9"
 
+[features]
+# NOT for users. Compiled out unless explicitly enabled; only the repository's ci/consumer check
+# enables it. With it, the TLS root store also trusts the PEM certificates in the environment
+# variable CEXY_TEST_EXTRA_ROOT_PEM, so a consumer build can reach a local test server over real
+# TLS. Enabling it in a production build would let whoever controls the process environment add
+# a trusted root (and so intercept API traffic): do not enable it.
+__test-extra-root = []
+
 [dev-dependencies]
 rcgen = { version = "0.13", default-features = false, features = ["crypto", "ring"] }
 regex = "1.13.1"

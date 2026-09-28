@@ -1,6 +1,11 @@
 # A crate that depends on cexy the way a user's project does: no cexy dev-dependencies, so
 # their features cannot mask a missing one (0.1.0-dev.1 advertised h2 without reqwest's
 # http2 feature; the SDK's own tests passed only because a dev-dependency enabled it).
+#
+# It runs one real request through cexy's normal client against a local TLS server that
+# negotiates HTTP/2 (ALPN h2), without internet. The only extra cexy feature is
+# `__test-extra-root`, which lets the client trust that server's self-signed certificate; it
+# enables nothing in reqwest or hyper, so a missing http2 feature still fails here.
 [package]
 name = "cexy-consumer-check"
 version = "0.0.0"
@@ -8,7 +13,13 @@ edition = "2024"
 publish = false
 
 [dependencies]
-cexy = { path = "../.." }
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+cexy = { path = "../..", features = ["__test-extra-root"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
+# Local HTTP/2 TLS server (consumer only; never a dependency of cexy).
+rcgen = { version = "0.13", default-features = false, features = ["crypto", "ring", "pem"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+h2 = "0.4"
+http = "1"
+bytes = "1"
 
 [workspace]

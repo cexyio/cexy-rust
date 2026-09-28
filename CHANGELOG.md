@@ -6,6 +6,14 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed (CI)
+- The `ci/consumer` check now makes one real request, without internet, through the normal
+  (non-test) client to a local TLS server that only speaks HTTP/2 (ALPN h2). A client that can't
+  do HTTP/2 over TLS, as in 0.1.0-dev.1, now fails CI, not just the feature check. It trusts the
+  server's self-signed certificate through a new off-by-default, doc-hidden feature,
+  `__test-extra-root`, which reads `CEXY_TEST_EXTRA_ROOT_PEM`. Only that check enables it; it is not
+  for users.
+
 ## [0.1.0-dev.2] (2026-09-27)
 
 ### Fixed

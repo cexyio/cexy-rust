@@ -37,7 +37,7 @@ jobs:
         run: |
           cargo install cargo-audit --version 0.22.2 --locked
           cargo audit
-      - name: Builds as a dependency (no dev-dependency features; ALPN h2 needs reqwest http2)
+      - name: Works as a dependency (no dev-dependency features; one offline request over TLS + HTTP/2)
         run: |
           cargo tree -e features -i hyper --edges normal | grep -q 'hyper feature "http2"'
           cargo build --manifest-path ci/consumer/Cargo.toml

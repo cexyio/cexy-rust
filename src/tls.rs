@@ -20,6 +20,8 @@ fn build() -> Arc<ClientConfig> {
     for c in TEST_ROOTS.lock().unwrap().iter() {
         roots.add(c.clone()).expect("test root");
     }
+    #[cfg(feature = "__test-extra-root")]
+    extra_test_roots(&mut roots);
     let config =
         ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
             .with_safe_default_protocol_versions()
@@ -27,6 +29,21 @@ fn build() -> Arc<ClientConfig> {
             .with_root_certificates(roots)
             .with_no_client_auth();
     Arc::new(config)
+}
+
+/// `__test-extra-root` feature only (off by default, never for users): also trust the PEM
+/// certificates in `CEXY_TEST_EXTRA_ROOT_PEM`. The repository's `ci/consumer` check uses it to
+/// reach a local TLS test server through the real, non-test build of the client. Whoever controls
+/// the environment of a process built with this feature can add a trusted root, which is why it is
+/// a compile-time opt-in and not a runtime option.
+#[cfg(feature = "__test-extra-root")]
+fn extra_test_roots(roots: &mut RootCertStore) {
+    use rustls::pki_types::{CertificateDer, pem::PemObject};
+    if let Ok(pem) = std::env::var("CEXY_TEST_EXTRA_ROOT_PEM") {
+        for cert in CertificateDer::pem_slice_iter(pem.as_bytes()).flatten() {
+            let _ = roots.add(cert);
+        }
+    }
 }
 
 /// The shared rustls client configuration.
