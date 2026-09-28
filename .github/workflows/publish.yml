@@ -62,8 +62,11 @@ jobs:
       - name: Works as a dependency (no dev-dependency features; one offline request over TLS + HTTP/2)
         run: |
           cargo tree -e features -i hyper --edges normal | grep -q 'hyper feature "http2"'
-          cargo build --manifest-path ci/consumer/Cargo.toml
-          cargo run --manifest-path ci/consumer/Cargo.toml
+          # Normal build: CEXY_TEST_EXTRA_ROOT_PEM must be ignored, so the self-signed server is rejected.
+          CARGO_TARGET_DIR=target/consumer-normal cargo run --manifest-path ci/consumer/Cargo.toml -- expect-reject
+          # Test-root build (a rustc cfg, set only here): one offline request over TLS + HTTP/2.
+          RUSTFLAGS="--cfg cexy_test_extra_root" CARGO_TARGET_DIR=target/consumer-cfg \
+            cargo run --manifest-path ci/consumer/Cargo.toml -- trusted
       - name: Package (and print the file list and checksum)
         run: |
           cargo package --locked

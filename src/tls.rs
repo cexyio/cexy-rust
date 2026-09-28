@@ -20,7 +20,7 @@ fn build() -> Arc<ClientConfig> {
     for c in TEST_ROOTS.lock().unwrap().iter() {
         roots.add(c.clone()).expect("test root");
     }
-    #[cfg(feature = "__test-extra-root")]
+    #[cfg(cexy_test_extra_root)]
     extra_test_roots(&mut roots);
     let config =
         ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
@@ -31,12 +31,15 @@ fn build() -> Arc<ClientConfig> {
     Arc::new(config)
 }
 
-/// `__test-extra-root` feature only (off by default, never for users): also trust the PEM
-/// certificates in `CEXY_TEST_EXTRA_ROOT_PEM`. The repository's `ci/consumer` check uses it to
-/// reach a local TLS test server through the real, non-test build of the client. Whoever controls
-/// the environment of a process built with this feature can add a trusted root, which is why it is
-/// a compile-time opt-in and not a runtime option.
-#[cfg(feature = "__test-extra-root")]
+/// Only in builds compiled with `RUSTFLAGS="--cfg cexy_test_extra_root"` (never a normal build):
+/// also trust the PEM certificates in `CEXY_TEST_EXTRA_ROOT_PEM`. The repository's `ci/consumer`
+/// check uses it to reach a local TLS test server through the real, non-test client.
+///
+/// It is a rustc cfg, not a Cargo feature, on purpose: features unify across a dependency graph, so
+/// any dependency could enable one silently, and whoever controls the environment of such a build
+/// could then add a trusted root and intercept API traffic. A cfg can only come from the top-level
+/// build's own flags. Both opt-ins are needed: the cfg at compile time and the variable at run time.
+#[cfg(cexy_test_extra_root)]
 fn extra_test_roots(roots: &mut RootCertStore) {
     use rustls::pki_types::{CertificateDer, pem::PemObject};
     if let Ok(pem) = std::env::var("CEXY_TEST_EXTRA_ROOT_PEM") {
