@@ -130,6 +130,9 @@ class Gen:
                 return "Amount", "value"
             if name == "DetailValue":
                 return "serde_json::Value", "json"
+            target = self.schemas.get(name, {})
+            if self.is_tagged_union(target):
+                return rust_name(name), "json_union"
             return rust_name(name), "value"
         if "allOf" in s and len(s["allOf"]) == 1:
             return self.base_type(s["allOf"][0])
@@ -161,6 +164,11 @@ class Gen:
             return typ, "#[serde(default)]"
         if kind == "json":
             return typ, "#[serde(default, skip_serializing_if = \"serde_json::Value::is_null\")]"
+        if kind == "json_union":
+            if (not required) or s.get("nullable", False):
+                return f"Option<{typ}>", "#[serde(default, skip_serializing_if = \"Option::is_none\")]"
+            # A missing value decodes as Unknown(null) rather than failing the whole object.
+            return typ, "#[serde(default)]"
         if (not required) or s.get("nullable", False):
             return f"Option<{typ}>", "#[serde(default, skip_serializing_if = \"Option::is_none\")]"
         return typ, ""
@@ -185,6 +193,10 @@ class Gen:
                 out.append(self.enum(rname, s, extra))
             elif s.get("type") == "object" and "properties" in s:
                 out.append(self.struct(rname, s, name.endswith("Request")))
+            elif s.get("type") == "string":
+                out.append(self.alias(rname, s))
+            elif self.is_tagged_union(s):
+                out.append(self.union(rname, s))
             else:
                 raise SystemExit(f"schema {name} is neither an enum nor an object")
         body = "".join(out)
@@ -241,6 +253,74 @@ class Gen:
             lines.append(f"    /// A request with the required fields ({what}); the optional ones are unset.\n")
             lines.append(f"    pub fn new({args}) -> Self {{\n        Self {{ {', '.join(inits)} }}\n    }}\n}}\n\n")
         return "".join(lines)
+
+    @staticmethod
+    def is_tagged_union(s: dict) -> bool:
+        """A oneOf whose variants are objects told apart by a one-value `type` enum."""
+        variants = s.get("oneOf") or []
+        return bool(variants) and all(
+            v.get("type") == "object" and len(((v.get("properties") or {}).get("type") or {}).get("enum") or []) == 1
+            for v in variants)
+
+    def alias(self, rname: str, s: dict) -> str:
+        """A plain string schema (an id): a type alias, deliberately not validated client-side, so a
+        future id format does not break callers."""
+        return (doc(s.get("description")) or f"/// {rname}: a string.\n") + f"pub type {rname} = String;\n\n"
+
+    def union(self, rname: str, s: dict) -> str:
+        """A `type`-tagged union: one struct per variant and an enum with an `Unknown` fallback that
+        keeps the raw JSON, so a variant added to the API later never fails to decode."""
+        out: list[str] = []
+        arms: list[tuple[str, str, str]] = []  # (tag, variant, struct)
+        for v in s["oneOf"]:
+            tag = v["properties"]["type"]["enum"][0]
+            variant = pascal(tag)
+            sname = f"{rname}{variant}"
+            props = {k: p for k, p in v["properties"].items() if k != "type"}
+            body = {"type": "object", "properties": props,
+                    "required": [r for r in v.get("required", []) if r != "type"],
+                    "description": v.get("description")}
+            if props:
+                out.append(self.struct(sname, body, False))
+            else:
+                out.append((doc(v.get("description")) or f"/// {sname}\n") +
+                           "#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]\n" +
+                           f"pub struct {sname} {{}}\n\n")
+            arms.append((tag, variant, sname))
+        lines = [doc(s.get("description")) or f"/// {rname}: one of several kinds, told apart by `type`.\n",
+                 "///\n/// Decoding never fails on a kind this SDK does not know yet (or a known kind with an\n"
+                 "/// unexpected shape): it becomes [`" + rname + "::Unknown`] with the raw JSON.\n",
+                 "#[derive(Debug, Clone, PartialEq)]\n#[non_exhaustive]\n", f"pub enum {rname} {{\n"]
+        for tag, variant, sname in arms:
+            lines.append(f"    /// `type: {json.dumps(tag)}`\n    {variant}({sname}),\n")
+        lines.append("    /// A kind this SDK does not know yet, kept as the raw JSON object.\n"
+                     "    Unknown(serde_json::Value),\n}\n\n")
+        lines.append(f"impl Default for {rname} {{\n    /// `Unknown(null)`: what a missing value decodes as.\n"
+                     "    fn default() -> Self {\n        Self::Unknown(serde_json::Value::Null)\n    }\n}\n\n")
+        lines.append(f"impl {rname} {{\n    /// The `type` tag of this value.\n"
+                     "    pub fn kind(&self) -> &str {\n        match self {\n")
+        for tag, variant, _ in arms:
+            lines.append(f"            Self::{variant}(_) => {json.dumps(tag)},\n")
+        lines.append('            Self::Unknown(v) => v.get("type").and_then(|t| t.as_str()).unwrap_or(""),\n'
+                     "        }\n    }\n}\n\n")
+        lines.append(f"impl<'de> Deserialize<'de> for {rname} {{\n"
+                     "    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {\n"
+                     "        let v = serde_json::Value::deserialize(d)?;\n"
+                     '        let parsed = match v.get("type").and_then(|t| t.as_str()) {\n')
+        for tag, variant, _ in arms:
+            lines.append(f"            Some({json.dumps(tag)}) => serde_json::from_value(v.clone()).ok().map(Self::{variant}),\n")
+        lines.append("            _ => None,\n        };\n"
+                     "        Ok(parsed.unwrap_or(Self::Unknown(v)))\n    }\n}\n\n")
+        lines.append(f"impl Serialize for {rname} {{\n"
+                     "    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {\n"
+                     "        let (tag, mut v) = match self {\n")
+        for tag, variant, _ in arms:
+            lines.append(f"            Self::{variant}(x) => ({json.dumps(tag)}, serde_json::to_value(x).map_err(serde::ser::Error::custom)?),\n")
+        lines.append("            Self::Unknown(v) => return v.serialize(s),\n        };\n"
+                     "        if let serde_json::Value::Object(m) = &mut v {\n"
+                     '            m.insert("type".to_owned(), serde_json::Value::String(tag.to_owned()));\n'
+                     "        }\n        v.serialize(s)\n    }\n}\n\n")
+        return "".join(out) + "".join(lines)
 
     @staticmethod
     def init(f: str, t: str) -> str:

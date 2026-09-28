@@ -15,12 +15,12 @@ The official Rust SDK for the [CEXY.io](https://cexy.io) REST and WebSocket API.
 
 ```toml
 [dependencies]
-cexy = "=0.1.0-dev.2"
+cexy = "=0.1.0-dev.3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
 Cargo never picks a pre-release (a version with `-dev.N`) on its own: name it explicitly. The
-exact requirement above (`=0.1.0-dev.2`) is the safest way; move it by hand for each new pre-release.
+exact requirement above (`=0.1.0-dev.3`) is the safest way; move it by hand for each new pre-release.
 
 ## Quick start: public data
 
@@ -73,7 +73,8 @@ Placing and cancelling need a key with the **trade** scope; everything else need
 
 ### Cancel-all
 
-One `cancel_all` call handles at most 500 orders. Every order it handled is in exactly one of
+Cancel-all also cancels stop orders that have not triggered yet (`pending_trigger`) and releases their
+reservations. One `cancel_all` call handles at most 500 orders. Every order it handled is in exactly one of
 `cancelled`, `already_closed` (it closed on its own first: not a failure) and `failed` (the reason is
 in `failures`; `INVALID_STATE` means the order was still being placed). `has_more` means there are
 more. An unknown symbol is a `NotFound` error, and the server allows 30 cancel-all calls a minute.

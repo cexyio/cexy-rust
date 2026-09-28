@@ -1,6 +1,6 @@
 //! The REST services: public market data, account, exports, wallet reads, trading and pools.
 
-use crate::amount::{Amount, check_amounts};
+use crate::amount::check_amounts;
 use crate::client::Client;
 use crate::error::{Error, ErrorCategory, Result};
 use crate::models_gen::*;
@@ -184,23 +184,15 @@ impl Pools<'_> {
     /// Adds liquidity. Amounts are decimal strings. The Idempotency-Key (generated, or set with
     /// [`crate::CallOptions::idempotency_key`]) makes retries safe.
     pub async fn join(&self, symbol: &str, req: &JoinPoolRequest) -> Result<JoinPoolResult> {
-        let max_dev = req
-            .max_ratio_deviation_percent
-            .clone()
-            .map(Amount::try_from);
-        let max_dev = match max_dev {
-            Some(Err(_)) => Some(Amount::default_invalid(
-                req.max_ratio_deviation_percent.as_deref().unwrap_or(""),
-            )),
-            Some(Ok(a)) => Some(a),
-            None => None,
-        };
         check_amounts(
             "pools.join",
             &[
                 ("base_amount", Some(&req.base_amount)),
                 ("quote_amount", Some(&req.quote_amount)),
-                ("max_ratio_deviation_percent", max_dev.as_ref()),
+                (
+                    "max_ratio_deviation_percent",
+                    req.max_ratio_deviation_percent.as_ref(),
+                ),
             ],
         )?;
         self.c
@@ -613,6 +605,9 @@ impl<'a> Trading<'a> {
     /// [`Trading::cancel_all_markets`] for that. An unknown symbol is an API error in the
     /// `NotFound` category.
     ///
+    /// It also cancels stop orders that have not triggered yet (status `pending_trigger`) and
+    /// releases their reservations, so nothing fires into the market after the call.
+    ///
     /// One call handles at most 500 orders. Every order it handled is in exactly one of
     /// `cancelled`, `already_closed` (it closed on its own first: not a failure) and `failed`
     /// (with the reason in `failures`; `INVALID_STATE` means it was still being placed).
@@ -658,13 +653,6 @@ fn cancel_all_call(symbol: Option<&str>) -> Result<Call> {
     })?;
     call.no_idempotency_key = true;
     Ok(call)
-}
-
-impl Amount {
-    /// An amount holding text that failed validation, so `check_amounts` reports it.
-    fn default_invalid(text: &str) -> Amount {
-        serde_json::from_value(serde_json::Value::String(text.to_string())).unwrap_or_default()
-    }
 }
 
 /// A copy of an error for wrapping (errors hold no resources).

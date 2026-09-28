@@ -6,6 +6,26 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-dev.3] (2026-09-28)
+
+Synced with the API's H-1 release.
+
+### Added
+- `LedgerEntry.reference` is typed: `LedgerReference`, an enum with one variant per cause (`Deposit`,
+  `Withdrawal`, `Order`, `Trade`, `Transfer`, `Adjustment`, `Pool`, `FuturesTransfer`, `System`) and
+  `kind()`. A cause this version doesn't know, or a malformed one, decodes as `Unknown(raw JSON)`, and
+  a missing reference as `Unknown(null)`, so decoding never fails on it. It used to be a raw
+  `serde_json::Value`.
+- Id aliases `OrderId`, `TradeId`, `DepositId`, `WithdrawalId`, `PoolId`, `UserId`,
+  `FuturesTransferId`: plain `String`s, deliberately not validated.
+- Error code `PRICE_UNAVAILABLE` (422, `Unprocessable`); withdrawal status `reverted`; new ledger entry
+  kinds for held transfers, releases, reversals and withdrawal refunds.
+
+### Changed
+- `JoinPoolRequest.max_ratio_deviation_percent` is an `Amount` (it was a `String`), checked before
+  sending like the other amounts.
+- Docs: cancel-all also cancels stop orders that have not triggered yet (`pending_trigger`).
+
 ### Changed (CI)
 - The `ci/consumer` check now makes one real request, without internet, through the normal
   (non-test) client to a local TLS server that only speaks HTTP/2 (ALPN h2). A client that can't

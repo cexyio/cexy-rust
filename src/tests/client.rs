@@ -267,7 +267,7 @@ async fn invalid_amounts_are_rejected_before_sending() {
         crate::Amount::new("1").unwrap(),
         crate::Amount::new("1").unwrap(),
     );
-    j.max_ratio_deviation_percent = Some("one".into());
+    j.max_ratio_deviation_percent = Some(serde_json::from_value(json!("one")).unwrap());
     let e = c.pools().join("BTC/USDT", &j).await.unwrap_err();
     assert!(
         matches!(e, Error::InvalidAmount { ref field, .. } if field == "max_ratio_deviation_percent"),

@@ -259,6 +259,9 @@ pub struct DepositAddress {
     pub network: String,
 }
 
+/// Unique identifier of a deposit.
+pub type DepositId = String;
+
 /// A deposit.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Deposit {
@@ -359,6 +362,7 @@ open_enum! {
         WithdrawalDisabled => "WITHDRAWAL_DISABLED",
         SelfTradeBlocked => "SELF_TRADE_BLOCKED",
         LimitExceeded => "LIMIT_EXCEEDED",
+        PriceUnavailable => "PRICE_UNAVAILABLE",
         RateLimited => "RATE_LIMITED",
         Internal => "INTERNAL",
         ServiceUnavailable => "SERVICE_UNAVAILABLE",
@@ -481,14 +485,17 @@ pub struct Fill {
     pub trade_id: String,
 }
 
+/// Unique identifier of a futures collateral transfer.
+pub type FuturesTransferId = String;
+
 /// Adds liquidity to a pool.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct JoinPoolRequest {
     /// `base_amount`
     pub base_amount: Amount,
-    /// How far, in percent, the offered ratio may sit from the pool's own before the request is refused rather than repriced. Defaults to 1%.
+    /// `max_ratio_deviation_percent`
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_ratio_deviation_percent: Option<String>,
+    pub max_ratio_deviation_percent: Option<Amount>,
     /// `quote_amount`
     pub quote_amount: Amount,
 }
@@ -537,6 +544,9 @@ open_enum! {
         TradeFee => "trade_fee",
         TransferOut => "transfer_out",
         TransferIn => "transfer_in",
+        TransferInHeld => "transfer_in_held",
+        TransferRelease => "transfer_release",
+        TransferReversal => "transfer_reversal",
         AdjustmentCredit => "adjustment_credit",
         AdjustmentDebit => "adjustment_debit",
         Rebate => "rebate",
@@ -548,6 +558,8 @@ open_enum! {
         FuturesCollateralReturned => "futures_collateral_returned",
         TradeFeeRevenue => "trade_fee_revenue",
         WithdrawalFeeRevenue => "withdrawal_fee_revenue",
+        WithdrawalRefund => "withdrawal_refund",
+        WithdrawalFeeRevenueReversal => "withdrawal_fee_revenue_reversal",
         FuturesTransferFeeRevenue => "futures_transfer_fee_revenue",
         FuturesHyperliquidCost => "futures_hyperliquid_cost",
         FuturesTransferDiscrepancy => "futures_transfer_discrepancy",
@@ -574,11 +586,203 @@ pub struct LedgerEntry {
     pub locked_delta: Amount,
     /// `pending_delta`
     pub pending_delta: Amount,
-    /// What caused the entry.
-    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
-    pub reference: serde_json::Value,
+    /// `reference`
+    #[serde(default)]
+    pub reference: LedgerReference,
     /// Position in this account's history for this asset.
     pub sequence: i64,
+}
+
+/// A blockchain deposit.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LedgerReferenceDeposit {
+    /// `deposit_id`
+    pub deposit_id: DepositId,
+}
+
+/// A withdrawal request.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LedgerReferenceWithdrawal {
+    /// `withdrawal_id`
+    pub withdrawal_id: WithdrawalId,
+}
+
+/// An order reservation or release.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LedgerReferenceOrder {
+    /// `order_id`
+    pub order_id: OrderId,
+}
+
+/// A trade settlement.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LedgerReferenceTrade {
+    /// `order_id`
+    pub order_id: OrderId,
+    /// `trade_id`
+    pub trade_id: TradeId,
+}
+
+/// An internal transfer between accounts.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LedgerReferenceTransfer {
+    /// `counterparty_user_id`
+    pub counterparty_user_id: UserId,
+    /// Shared reference linking both halves.
+    pub transfer_ref: String,
+}
+
+/// A manual operator adjustment. Always accompanied by an audit event.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LedgerReferenceAdjustment {
+    /// `operator_user_id`
+    pub operator_user_id: UserId,
+}
+
+/// A liquidity pool join or exit.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LedgerReferencePool {
+    /// `pool_id`
+    pub pool_id: PoolId,
+}
+
+/// A movement of collateral to or from a futures account.
+///
+/// Every entry a transfer produces carries the same one, so the reservation, the release and the completion can be read back as one event — which is what an operator resolving an ambiguous transfer needs.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LedgerReferenceFuturesTransfer {
+    /// `futures_transfer_id`
+    pub futures_transfer_id: FuturesTransferId,
+}
+
+/// A system-originated credit with no user counterparty (rebate, promotion).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LedgerReferenceSystem {
+    /// Short machine-readable cause.
+    pub cause: String,
+}
+
+/// What caused a ledger entry: one kind of cause per variant, told apart by `type`.
+///
+/// Decoding never fails on a kind this SDK does not know yet (or a known kind with an
+/// unexpected shape): it becomes [`LedgerReference::Unknown`] with the raw JSON.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub enum LedgerReference {
+    /// `type: "deposit"`
+    Deposit(LedgerReferenceDeposit),
+    /// `type: "withdrawal"`
+    Withdrawal(LedgerReferenceWithdrawal),
+    /// `type: "order"`
+    Order(LedgerReferenceOrder),
+    /// `type: "trade"`
+    Trade(LedgerReferenceTrade),
+    /// `type: "transfer"`
+    Transfer(LedgerReferenceTransfer),
+    /// `type: "adjustment"`
+    Adjustment(LedgerReferenceAdjustment),
+    /// `type: "pool"`
+    Pool(LedgerReferencePool),
+    /// `type: "futures_transfer"`
+    FuturesTransfer(LedgerReferenceFuturesTransfer),
+    /// `type: "system"`
+    System(LedgerReferenceSystem),
+    /// A kind this SDK does not know yet, kept as the raw JSON object.
+    Unknown(serde_json::Value),
+}
+
+impl Default for LedgerReference {
+    /// `Unknown(null)`: what a missing value decodes as.
+    fn default() -> Self {
+        Self::Unknown(serde_json::Value::Null)
+    }
+}
+
+impl LedgerReference {
+    /// The `type` tag of this value.
+    pub fn kind(&self) -> &str {
+        match self {
+            Self::Deposit(_) => "deposit",
+            Self::Withdrawal(_) => "withdrawal",
+            Self::Order(_) => "order",
+            Self::Trade(_) => "trade",
+            Self::Transfer(_) => "transfer",
+            Self::Adjustment(_) => "adjustment",
+            Self::Pool(_) => "pool",
+            Self::FuturesTransfer(_) => "futures_transfer",
+            Self::System(_) => "system",
+            Self::Unknown(v) => v.get("type").and_then(|t| t.as_str()).unwrap_or(""),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for LedgerReference {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let v = serde_json::Value::deserialize(d)?;
+        let parsed = match v.get("type").and_then(|t| t.as_str()) {
+            Some("deposit") => serde_json::from_value(v.clone()).ok().map(Self::Deposit),
+            Some("withdrawal") => serde_json::from_value(v.clone()).ok().map(Self::Withdrawal),
+            Some("order") => serde_json::from_value(v.clone()).ok().map(Self::Order),
+            Some("trade") => serde_json::from_value(v.clone()).ok().map(Self::Trade),
+            Some("transfer") => serde_json::from_value(v.clone()).ok().map(Self::Transfer),
+            Some("adjustment") => serde_json::from_value(v.clone()).ok().map(Self::Adjustment),
+            Some("pool") => serde_json::from_value(v.clone()).ok().map(Self::Pool),
+            Some("futures_transfer") => serde_json::from_value(v.clone())
+                .ok()
+                .map(Self::FuturesTransfer),
+            Some("system") => serde_json::from_value(v.clone()).ok().map(Self::System),
+            _ => None,
+        };
+        Ok(parsed.unwrap_or(Self::Unknown(v)))
+    }
+}
+
+impl Serialize for LedgerReference {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let (tag, mut v) = match self {
+            Self::Deposit(x) => (
+                "deposit",
+                serde_json::to_value(x).map_err(serde::ser::Error::custom)?,
+            ),
+            Self::Withdrawal(x) => (
+                "withdrawal",
+                serde_json::to_value(x).map_err(serde::ser::Error::custom)?,
+            ),
+            Self::Order(x) => (
+                "order",
+                serde_json::to_value(x).map_err(serde::ser::Error::custom)?,
+            ),
+            Self::Trade(x) => (
+                "trade",
+                serde_json::to_value(x).map_err(serde::ser::Error::custom)?,
+            ),
+            Self::Transfer(x) => (
+                "transfer",
+                serde_json::to_value(x).map_err(serde::ser::Error::custom)?,
+            ),
+            Self::Adjustment(x) => (
+                "adjustment",
+                serde_json::to_value(x).map_err(serde::ser::Error::custom)?,
+            ),
+            Self::Pool(x) => (
+                "pool",
+                serde_json::to_value(x).map_err(serde::ser::Error::custom)?,
+            ),
+            Self::FuturesTransfer(x) => (
+                "futures_transfer",
+                serde_json::to_value(x).map_err(serde::ser::Error::custom)?,
+            ),
+            Self::System(x) => (
+                "system",
+                serde_json::to_value(x).map_err(serde::ser::Error::custom)?,
+            ),
+            Self::Unknown(v) => return v.serialize(s),
+        };
+        if let serde_json::Value::Object(m) = &mut v {
+            m.insert("type".to_owned(), serde_json::Value::String(tag.to_owned()));
+        }
+        v.serialize(s)
+    }
 }
 
 open_enum! {
@@ -776,6 +980,9 @@ pub struct OrderBook {
     pub timestamp: DateTime<Utc>,
 }
 
+/// Unique identifier of an order.
+pub type OrderId = String;
+
 /// An order.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Order {
@@ -952,6 +1159,9 @@ pub struct PlaceOrderResponse {
     pub order: Order,
 }
 
+/// Unique identifier of a liquidity pool.
+pub type PoolId = String;
+
 /// A pool as a client sees it.
 ///
 /// Reserves are the custody account's balances, so they include liquidity currently locked in resting orders. `price` is the curve's mid, which sits between the pool's own best bid and ask by exactly its fee — it is not a traded price.
@@ -1058,6 +1268,9 @@ open_enum! {
     }
 }
 
+/// Unique identifier of a trade.
+pub type TradeId = String;
+
 open_enum! {
     /// Which way the price must move for a stop to fire.
     ///
@@ -1069,6 +1282,9 @@ open_enum! {
         Below => "below",
     }
 }
+
+/// Unique identifier of a user account.
+pub type UserId = String;
 
 /// A saved withdrawal address.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1107,6 +1323,9 @@ pub struct WithdrawalHistoryEntry {
     /// `status`
     pub status: WithdrawalStatus,
 }
+
+/// Unique identifier of a withdrawal.
+pub type WithdrawalId = String;
 
 /// A withdrawal.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1174,5 +1393,6 @@ open_enum! {
         Cancelled => "cancelled",
         Failed => "failed",
         BroadcastUnknown => "broadcast_unknown",
+        Reverted => "reverted",
     }
 }
