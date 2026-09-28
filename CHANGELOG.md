@@ -6,6 +6,15 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed (CI)
+- The `ci/consumer` check now makes one real request, without internet, through the normal
+  (non-test) client to a local TLS server that only speaks HTTP/2 (ALPN h2). A client that can't
+  do HTTP/2 over TLS, as in 0.1.0-dev.1, now fails CI, not just the feature check. It trusts the
+  server's self-signed certificate only when built with `RUSTFLAGS="--cfg cexy_test_extra_root"`
+  and given `CEXY_TEST_EXTRA_ROOT_PEM`. That's a rustc cfg, not a Cargo feature, so no dependency
+  can switch it on. A second run checks that a normal build ignores the variable and rejects the
+  server.
+
 ## [0.1.0-dev.2] (2026-09-27)
 
 ### Fixed

@@ -38,6 +38,10 @@ wiremock = "0.6.5"
 [lints.rust]
 unsafe_code = "forbid"
 missing_docs = "warn"
+# `cexy_test_extra_root` is set only by the repository's ci/consumer check, through
+# RUSTFLAGS="--cfg cexy_test_extra_root" (see src/tls.rs). It is deliberately not a Cargo feature:
+# features unify across a dependency graph, so any crate could switch it on silently.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(cexy_test_extra_root)'] }
 
 [lints.clippy]
 all = { level = "warn", priority = -1 }
