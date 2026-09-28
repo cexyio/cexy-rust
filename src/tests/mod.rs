@@ -6,6 +6,7 @@ mod client;
 mod conformance;
 mod errors;
 mod helpers;
+mod models;
 mod pagination;
 mod redirect;
 mod trading;
