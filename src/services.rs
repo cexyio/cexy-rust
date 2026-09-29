@@ -281,6 +281,23 @@ impl<'a> Account<'a> {
         self.c.get(Call::new(OperationId::ListSubAccounts)).await
     }
 
+    /// A sub-account's balances, read by its PARENT account: the same shape as
+    /// [`Account::balances`] (zero balances omitted), including `held_incoming`, whose sum is
+    /// already inside `locked`. The server currently returns them ordered by asset symbol; don't
+    /// rely on the order. An id that is not one of the caller's sub-accounts (or a call made with
+    /// the sub-account's own key) is an API error in
+    /// [`ErrorCategory::NotFound`](crate::ErrorCategory::NotFound) and is not retried; a
+    /// sub-account's own key reads its balances with [`Account::balances`]. A malformed id gets
+    /// 400 ([`ErrorCategory::Validation`](crate::ErrorCategory::Validation)); a key without the
+    /// read scope gets 403 `FORBIDDEN` ([`ErrorCategory::Forbidden`](crate::ErrorCategory::Forbidden)).
+    /// `id` must be non-empty and not `"."` or `".."` (a config error before any request); it is
+    /// sent as one URL path segment.
+    pub async fn sub_account_balances(&self, id: &str) -> Result<Vec<Balance>> {
+        self.c
+            .get(Call::new(OperationId::SubAccountBalances).path("id", id))
+            .await
+    }
+
     /// Your API keys (metadata only; secrets are never returned).
     pub async fn api_keys(&self) -> Result<Vec<ApiKey>> {
         self.c.get(Call::new(OperationId::ListApiKeys)).await

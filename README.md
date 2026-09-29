@@ -15,12 +15,12 @@ The official Rust SDK for the [CEXY.io](https://cexy.io) REST and WebSocket API.
 
 ```toml
 [dependencies]
-cexy = "=0.1.0-dev.3"
+cexy = "=0.1.0-dev.4"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
 Cargo never picks a pre-release (a version with `-dev.N`) on its own: name it explicitly. The
-exact requirement above (`=0.1.0-dev.3`) is the safest way; move it by hand for each new pre-release.
+exact requirement above (`=0.1.0-dev.4`) is the safest way; move it by hand for each new pre-release.
 
 ## Quick start: public data
 
@@ -55,6 +55,8 @@ let c = Client::new(ClientOptions::with_api_key(
 ))?;
 
 let balances = c.account().balances().await?;
+// A sub-account's balances (parent account only; same shape, incl. held_incoming):
+let sub_balances = c.account().sub_account_balances("sub-account-id").await?;
 let open = c.trading().open_orders(Some(&ListOpenOrdersParams { symbol: Some("BTC/USDT".into()), ..Default::default() })).await?;
 
 let mut order = PlaceOrderRequest::new("BTC/USDT", OrderSide::Buy, OrderType::Limit);
@@ -161,7 +163,9 @@ match c.trading().place_order(&order).await {
 ## Retries and idempotency
 
 - Timeout per attempt: `ClientOptions::timeout` (default 10 s). Retries: `max_retries` (default 3; `Some(0)` turns them off), exponential backoff with full jitter, capped at 10 s.
-- Retried: connection errors, timeouts and responses with `retryable: true`.
+- Retried: connection errors, timeouts and responses with `retryable: true` (and 409
+  `CONCURRENT_MODIFICATION`). A 4xx is never retried except 429 and 409 `CONCURRENT_MODIFICATION`,
+  whatever its body says.
 - A 429 waits at least `Retry-After` / `details.retry_after_seconds`.
 - GETs retry freely.
 - **Orders:** safety rests on `client_order_id`, not on `Idempotency-Key` (the server does not honour

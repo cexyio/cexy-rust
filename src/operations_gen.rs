@@ -94,6 +94,8 @@ pub enum OperationId {
     PlaceOrder,
     /// `server_time`
     ServerTime,
+    /// `sub_account_balances`
+    SubAccountBalances,
     /// `trade_history`
     TradeHistory,
 }
@@ -112,8 +114,8 @@ pub struct OperationInfo {
 }
 
 impl OperationId {
-    /// Every operation of the SDK surface (40).
-    pub const ALL: [OperationId; 40] = [
+    /// Every operation of the SDK surface (41).
+    pub const ALL: [OperationId; 41] = [
         OperationId::CancelAll,
         OperationId::CancelOrder,
         OperationId::DepositAddress,
@@ -153,6 +155,7 @@ impl OperationId {
         OperationId::OrderHistory,
         OperationId::PlaceOrder,
         OperationId::ServerTime,
+        OperationId::SubAccountBalances,
         OperationId::TradeHistory,
     ];
 
@@ -198,6 +201,7 @@ impl OperationId {
             OperationId::OrderHistory => "order_history",
             OperationId::PlaceOrder => "place_order",
             OperationId::ServerTime => "server_time",
+            OperationId::SubAccountBalances => "sub_account_balances",
             OperationId::TradeHistory => "trade_history",
         }
     }
@@ -438,6 +442,12 @@ impl OperationId {
                 path: "/api/v1/time",
                 auth: "none",
                 scope: "",
+            },
+            OperationId::SubAccountBalances => OperationInfo {
+                method: "GET",
+                path: "/api/v1/account/sub-accounts/{id}/balances",
+                auth: "api_key",
+                scope: "read",
             },
             OperationId::TradeHistory => OperationInfo {
                 method: "GET",

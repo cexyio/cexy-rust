@@ -6,10 +6,30 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-dev.4] (2026-09-29)
+
 ### Added
+- `account().sub_account_balances(id)`: a sub-account's balances, read by its parent account
+  (`GET /account/sub-accounts/{id}/balances`, read scope). Same `Vec<Balance>` as `balances()`,
+  including `held_incoming`. An id that is not the caller's sub-account is `ErrorCategory::NotFound`
+  (not retried); an empty id is a config error before any request.
 - `Balance::held_incoming` (`Vec<HeldIncoming>`: `transfer_id`, `amount`, `available_at`): incoming
   internal transfers still held, at most 100, soonest first. Their sum is already included in
   `locked`: never add it again. It decodes as an empty `Vec` when a server omits the field.
+
+### Changed
+- A 4xx response is never retried except 429 and 409 `CONCURRENT_MODIFICATION`, even when its body
+  says `retryable: true`; `Error::is_retryable()` reports this. A 408 is no longer retried either,
+  and its default `retryable` (no field in the body) is now false.
+  409 `CONCURRENT_MODIFICATION` and 429 are still retried only where they were before. A mutation
+  sent through the shared retry loop is retried only when it is repeat-safe (pool join/exit with
+  their `Idempotency-Key`, cancel-all); `place_order` and `cancel_order` keep their own policies.
+
+### Security
+- Path values `"."` and `".."` are rejected with a config error: previously they escaped their URL
+  segment, so e.g. `sub_account_balances("..")` returned the parent's own balances and
+  `order_by_client_id("..")` the open-orders list. A write request could only be redirected to a
+  route that does not exist and is refused by the server; no write could reach a different operation.
 
 ## [0.1.0-dev.3] (2026-09-28)
 

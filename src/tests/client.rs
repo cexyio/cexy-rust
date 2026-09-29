@@ -9,8 +9,8 @@ use super::helpers::*;
 use crate::{CallOptions, Client, ClientOptions, Error, ErrorCategory, OperationId};
 
 #[test]
-fn surface_has_40_operations() {
-    assert_eq!(OperationId::ALL.len(), 40);
+fn surface_has_41_operations() {
+    assert_eq!(OperationId::ALL.len(), 41);
     let place = OperationId::PlaceOrder.info();
     assert_eq!(
         (place.method, place.path, place.auth, place.scope),
@@ -311,4 +311,60 @@ async fn rate_limiter_blocks_after_a_429() {
     c.markets().list().await.unwrap();
     // Retry-After 3 s plus 125 ms jitter; the limiter's block has expired by then.
     assert_eq!(clock.sleeps(), vec![Duration::from_millis(3125)]);
+}
+
+#[tokio::test]
+async fn sub_account_balances_path_auth_and_held_incoming() {
+    let server = MockServer::start().await;
+    let row = json!({"asset": "USDT", "available": "90.00", "locked": "10.00", "pending": "0", "total": "100.00",
+        "held_incoming": [{"transfer_id": "cccccccccccccccccccccccc", "amount": "1.50", "available_at": "2026-09-30T10:00:00.001Z"}]});
+    Mock::given(method("GET"))
+        .and(path("/api/v1/account/sub-accounts/sub%2F1%20%3Fx/balances"))
+        .and(header("x-api-key", KEY))
+        .respond_with(data(json!([row])))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let (c, _) = client_with(&server, true, |_| {});
+    let bs = c.account().sub_account_balances("sub/1 ?x").await.unwrap();
+    assert_eq!(bs.len(), 1);
+    assert_eq!(bs[0].held_incoming.len(), 1);
+    assert_eq!(bs[0].held_incoming[0].amount.as_str(), "1.50");
+    let reqs = server.received_requests().await.unwrap();
+    assert!(reqs[0].headers.get("idempotency-key").is_none());
+}
+
+#[tokio::test]
+async fn sub_account_balances_missing_held_incoming_is_empty() {
+    let server = MockServer::start().await;
+    Mock::given(path("/api/v1/account/sub-accounts/sub_1/balances"))
+        .respond_with(data(json!([{"asset": "USDT", "available": "1", "locked": "0", "pending": "0", "total": "1"}])))
+        .mount(&server)
+        .await;
+    let (c, _) = client_with(&server, true, |_| {});
+    let bs = c.account().sub_account_balances("sub_1").await.unwrap();
+    assert!(bs[0].held_incoming.is_empty());
+}
+
+#[tokio::test]
+async fn sub_account_balances_404_is_not_found_with_one_request() {
+    let server = MockServer::start().await;
+    Mock::given(path("/api/v1/account/sub-accounts/other/balances"))
+        .respond_with(api_error(404, "NOT_FOUND", false))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let (c, _) = client_with(&server, true, |_| {});
+    let e = c.account().sub_account_balances("other").await.unwrap_err();
+    assert!(e.is(ErrorCategory::NotFound), "{e}");
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn sub_account_balances_empty_id_is_rejected_before_any_request() {
+    let server = MockServer::start().await;
+    let (c, _) = client_with(&server, true, |_| {});
+    let e = c.account().sub_account_balances("").await.unwrap_err();
+    assert!(matches!(e, Error::Config(_)), "{e}");
+    assert!(server.received_requests().await.unwrap().is_empty());
 }

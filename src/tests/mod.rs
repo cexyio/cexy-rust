@@ -8,6 +8,7 @@ mod errors;
 mod helpers;
 mod models;
 mod pagination;
+mod paths;
 mod redirect;
 mod trading;
 mod ws;

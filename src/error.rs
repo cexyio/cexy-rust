@@ -87,7 +87,8 @@ impl Error {
     }
 
     /// Whether an identical retry could succeed: a connection failure, or an API error marked
-    /// retryable (including 409 `CONCURRENT_MODIFICATION`).
+    /// retryable (including 409 `CONCURRENT_MODIFICATION`). A 4xx is never retryable except 429
+    /// and 409 `CONCURRENT_MODIFICATION`, whatever its body says.
     ///
     /// An error whose server wait (Retry-After) exceeds [`MAX_SERVER_WAIT`] is not retryable:
     /// the SDK fails fast instead of waiting that long. `retry_after` still carries the value.
@@ -95,8 +96,7 @@ impl Error {
         match self {
             Error::Connection(_) => true,
             Error::Api(e) => {
-                (e.retryable || e.code == ErrorCode::ConcurrentModification)
-                    && e.retry_after.is_none_or(|d| d <= MAX_SERVER_WAIT)
+                e.retryable_ignoring_wait() && e.retry_after.is_none_or(|d| d <= MAX_SERVER_WAIT)
             }
             _ => false,
         }
@@ -188,6 +188,19 @@ pub struct ApiError {
 }
 
 impl ApiError {
+    /// Marked retryable (or 409 `CONCURRENT_MODIFICATION`), and not a 4xx other than 429 and
+    /// 409 `CONCURRENT_MODIFICATION`; the server's wait is not considered.
+    pub(crate) fn retryable_ignoring_wait(&self) -> bool {
+        let concurrent = self.code == ErrorCode::ConcurrentModification;
+        if (400..500).contains(&self.status)
+            && self.status != 429
+            && !(self.status == 409 && concurrent)
+        {
+            return false;
+        }
+        self.retryable || concurrent
+    }
+
     /// The category, or `None` for a code this SDK does not know.
     pub fn category(&self) -> Option<ErrorCategory> {
         self.category
@@ -285,7 +298,7 @@ impl fmt::Display for WsError {
 impl std::error::Error for WsError {}
 
 fn default_retryable(status: u16) -> bool {
-    matches!(status, 408 | 429 | 500 | 502 | 503 | 504)
+    matches!(status, 429 | 500 | 502 | 503 | 504)
 }
 
 /// Builds the API error for an error response. A known code maps by HTTP status; an unknown
