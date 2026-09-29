@@ -6,7 +6,13 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-dev.4] (2026-09-29)
+
 ### Added
+- `account().sub_account_balances(id)`: a sub-account's balances, read by its parent account
+  (`GET /account/sub-accounts/{id}/balances`, read scope). Same `Vec<Balance>` as `balances()`,
+  including `held_incoming`. An id that is not the caller's sub-account is `ErrorCategory::NotFound`
+  (not retried); an empty id is a config error before any request.
 - `Balance::held_incoming` (`Vec<HeldIncoming>`: `transfer_id`, `amount`, `available_at`): incoming
   internal transfers still held, at most 100, soonest first. Their sum is already included in
   `locked`: never add it again. It decodes as an empty `Vec` when a server omits the field.

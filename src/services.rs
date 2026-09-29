@@ -281,6 +281,19 @@ impl<'a> Account<'a> {
         self.c.get(Call::new(OperationId::ListSubAccounts)).await
     }
 
+    /// A sub-account's balances, read by its PARENT account: the same shape as
+    /// [`Account::balances`] (zero balances omitted, sorted by asset), including `held_incoming`,
+    /// whose sum is already inside `locked`. An id that is not one of the caller's sub-accounts
+    /// (or a call made with the sub-account's own key) is an API error in
+    /// [`ErrorCategory::NotFound`](crate::ErrorCategory::NotFound) and is not retried; a
+    /// sub-account's own key reads its balances with [`Account::balances`]. `id` must be
+    /// non-empty (a config error before any request); it is sent as one URL path segment.
+    pub async fn sub_account_balances(&self, id: &str) -> Result<Vec<Balance>> {
+        self.c
+            .get(Call::new(OperationId::SubAccountBalances).path("id", id))
+            .await
+    }
+
     /// Your API keys (metadata only; secrets are never returned).
     pub async fn api_keys(&self) -> Result<Vec<ApiKey>> {
         self.c.get(Call::new(OperationId::ListApiKeys)).await
