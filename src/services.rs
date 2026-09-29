@@ -229,11 +229,17 @@ pub struct Account<'a> {
 
 impl<'a> Account<'a> {
     /// Every balance.
+    ///
+    /// [`Balance::held_incoming`] lists incoming internal transfers still held. Their sum is
+    /// ALREADY INCLUDED in `locked`: never add them to `locked` or `total` again. At most 100
+    /// entries, soonest `available_at` first (millisecond precision), with no sender identity. An
+    /// entry disappears once the transfer is released (its amount moves to `available`) or
+    /// cancelled by the exchange. It is empty, never missing, when a server omits the field.
     pub async fn balances(&self) -> Result<Vec<Balance>> {
         self.c.get(Call::new(OperationId::ListBalances)).await
     }
 
-    /// The balance of one asset.
+    /// The balance of one asset. See [`Account::balances`] for `held_incoming`.
     pub async fn balance(&self, asset: &str) -> Result<Balance> {
         self.c
             .get(Call::new(OperationId::GetBalance).path("asset", asset))

@@ -6,6 +6,11 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- `Balance::held_incoming` (`Vec<HeldIncoming>`: `transfer_id`, `amount`, `available_at`): incoming
+  internal transfers still held, at most 100, soonest first. Their sum is already included in
+  `locked`: never add it again. It decodes as an empty `Vec` when a server omits the field.
+
 ## [0.1.0-dev.3] (2026-09-28)
 
 Synced with the API's H-1 release.
