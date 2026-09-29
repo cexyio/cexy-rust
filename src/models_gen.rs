@@ -151,6 +151,9 @@ pub struct Balance {
     pub asset: String,
     /// `available`
     pub available: Amount,
+    /// Internal transfers to this account still held, soonest released first; empty when none. Their sum is part of `locked`. Shows at most 100.
+    #[serde(default)]
+    pub held_incoming: Vec<HeldIncoming>,
     /// `locked`
     pub locked: Amount,
     /// `pending`
@@ -487,6 +490,17 @@ pub struct Fill {
 
 /// Unique identifier of a futures collateral transfer.
 pub type FuturesTransferId = String;
+
+/// An internal transfer credited to `locked` and not yet available.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HeldIncoming {
+    /// `amount`
+    pub amount: Amount,
+    /// When it becomes available, unless an operator cancels it before then.
+    pub available_at: DateTime<Utc>,
+    /// The transfer.
+    pub transfer_id: String,
+}
 
 /// Adds liquidity to a pool.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

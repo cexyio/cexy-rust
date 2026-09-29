@@ -59,3 +59,33 @@ fn ids_are_plain_strings() {
     let id: crate::OrderId = "not-24-hex".to_string();
     assert_eq!(id, "not-24-hex");
 }
+
+#[test]
+fn balance_held_incoming_decodes_two_entries_empty_and_missing() {
+    use crate::Balance;
+    let row = |held: Option<serde_json::Value>| {
+        let mut v = json!({"asset": "USDT", "available": "90.00", "locked": "10.00", "pending": "0", "total": "100.00"});
+        if let Some(h) = held {
+            v["held_incoming"] = h;
+        }
+        v
+    };
+    let two: Balance = serde_json::from_value(row(Some(json!([
+        {"transfer_id": "aaaaaaaaaaaaaaaaaaaaaaaa", "amount": "4.00", "available_at": "2026-09-30T10:00:00.123Z"},
+        {"transfer_id": "bbbbbbbbbbbbbbbbbbbbbbbb", "amount": "6.00", "available_at": "2026-10-01T10:00:00.456Z"}
+    ]))))
+    .unwrap();
+    assert_eq!(two.held_incoming.len(), 2);
+    assert_eq!(two.held_incoming[0].transfer_id, "aaaaaaaaaaaaaaaaaaaaaaaa");
+    assert_eq!(two.held_incoming[0].amount.as_str(), "4.00");
+    assert_eq!(
+        two.held_incoming[0].available_at.timestamp_millis() % 1000,
+        123
+    );
+    assert_eq!(two.locked.as_str(), "10.00");
+
+    let empty: Balance = serde_json::from_value(row(Some(json!([])))).unwrap();
+    assert!(empty.held_incoming.is_empty());
+    let missing: Balance = serde_json::from_value(row(None)).unwrap();
+    assert!(missing.held_incoming.is_empty());
+}

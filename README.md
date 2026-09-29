@@ -96,6 +96,15 @@ println!("{} cancelled, {} still failing, stopped: {}", s.cancelled.len(), s.fai
 # Ok(()) }
 ```
 
+## Held incoming transfers
+
+`Balance::held_incoming` lists incoming internal transfers still held, each a `HeldIncoming` with
+`transfer_id`, `amount` and `available_at`. Their sum is **already included in `locked`**, so never
+add it to `locked` or `total` again. There are at most 100 entries, soonest `available_at` first
+(millisecond precision), with no sender identity. An entry disappears once the transfer is
+released (the amount moves to `available`) or cancelled by the exchange. It is always a `Vec`
+(empty when none, including from servers that predate the field).
+
 ## Amounts
 
 Every amount is an exact decimal string (`Amount::new("0.00150000")?`), in responses and requests.
