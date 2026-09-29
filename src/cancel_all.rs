@@ -178,11 +178,11 @@ impl Merge {
 
 /// Whether a failed round is worth repeating: a network failure, or an API error the server
 /// marked retryable (429 included, whatever its Retry-After: the loop decides against its
-/// budget).
+/// budget). A 4xx other than 429 and 409 `CONCURRENT_MODIFICATION` never is.
 fn round_retryable(e: &Error) -> bool {
     match e {
         Error::Connection(_) => true,
-        Error::Api(a) => a.retryable || a.code == ErrorCode::ConcurrentModification,
+        Error::Api(a) => a.retryable_ignoring_wait(),
         _ => false,
     }
 }

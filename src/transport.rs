@@ -116,19 +116,21 @@ pub(crate) struct Transport {
 impl Transport {
     /// Sends `c` with the standard retry policy: retryable errors and connection failures are
     /// retried. A mutation carries an Idempotency-Key reused on every attempt; the server honours
-    /// it on pool join and exit. `place_order` and `cancel_order` use `attempt` with their own
-    /// policies.
+    /// it on pool join and exit. A mutation is retried only when it is repeat-safe (see
+    /// [`repeat_safe`]); any other is sent once. `place_order` and `cancel_order` use `attempt`
+    /// with their own policies.
     pub(crate) async fn request(&self, mut c: Call, o: &Resolved) -> Result<Raw> {
         let info = c.op.info();
         if info.method != "GET" && c.idempotency_key.is_none() && !c.no_idempotency_key {
             c.idempotency_key = Some(o.idempotency_key.clone().unwrap_or_else(new_id));
         }
+        let max_retries = if repeat_safe(&c) { o.max_retries } else { 0 };
         let mut attempt = 0;
         loop {
             match self.attempt(&c, o).await {
                 Ok(raw) => return Ok(raw),
                 Err(e) => {
-                    if attempt >= o.max_retries || !e.is_retryable() {
+                    if attempt >= max_retries || !e.is_retryable() {
                         return Err(e);
                     }
                     self.backoff(c.op, attempt, &e, c.idempotency_key.as_deref())
@@ -307,7 +309,7 @@ impl Transport {
         Ok(Raw { body })
     }
 
-    fn build_url(&self, c: &Call) -> Result<Url> {
+    pub(crate) fn build_url(&self, c: &Call) -> Result<Url> {
         let info = c.op.info();
         let mut path = String::new();
         let mut rest = info.path;
@@ -327,6 +329,14 @@ impl Transport {
             if value.is_empty() || value.contains(['\r', '\n']) {
                 return Err(Error::config(format!(
                     "{} {}: {name} is required",
+                    info.method, info.path
+                )));
+            }
+            // "." and ".." would be dot segments: the url crate resolves them (even as %2E),
+            // so the request would silently go to a different route.
+            if value == "." || value == ".." {
+                return Err(Error::config(format!(
+                    "{} {}: {name} must not be \".\" or \"..\"",
                     info.method, info.path
                 )));
             }
@@ -355,6 +365,16 @@ impl Transport {
 }
 
 /// Percent-encodes one path segment (like encodeURIComponent: `/` becomes `%2F`).
+/// Whether `request` may retry `c`: reads, and the mutations that are safe to repeat: pool join
+/// and exit with their Idempotency-Key (the server honours it there), and cancel-all (naturally
+/// repeatable). The server ignores Idempotency-Key elsewhere, so no other mutation is retried.
+fn repeat_safe(c: &Call) -> bool {
+    c.op.info().method == "GET"
+        || c.op == OperationId::CancelAll
+        || (matches!(c.op, OperationId::JoinPool | OperationId::ExitPool)
+            && c.idempotency_key.is_some())
+}
+
 fn encode_segment(v: &str) -> String {
     let mut out = String::with_capacity(v.len());
     for b in v.bytes() {
