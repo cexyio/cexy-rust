@@ -19,7 +19,8 @@ All notable changes to this project are documented here. The format follows
 
 ### Changed
 - A 4xx response is never retried except 429 and 409 `CONCURRENT_MODIFICATION`, even when its body
-  says `retryable: true` (a 408 is no longer retried either); `Error::is_retryable()` reports this.
+  says `retryable: true`; `Error::is_retryable()` reports this. A 408 is no longer retried either,
+  and its default `retryable` (no field in the body) is now false.
   409 `CONCURRENT_MODIFICATION` and 429 are still retried only where they were before. A mutation
   sent through the shared retry loop is retried only when it is repeat-safe (pool join/exit with
   their `Idempotency-Key`, cancel-all); `place_order` and `cancel_order` keep their own policies.
@@ -27,8 +28,8 @@ All notable changes to this project are documented here. The format follows
 ### Security
 - Path values `"."` and `".."` are rejected with a config error: previously they escaped their URL
   segment, so e.g. `sub_account_balances("..")` returned the parent's own balances and
-  `order_by_client_id("..")` the open-orders list. Read-only operations only; no write request could
-  be redirected.
+  `order_by_client_id("..")` the open-orders list. A write request could only be redirected to a
+  route that does not exist and is refused by the server; no write could reach a different operation.
 
 ## [0.1.0-dev.3] (2026-09-28)
 

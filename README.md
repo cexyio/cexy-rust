@@ -163,7 +163,9 @@ match c.trading().place_order(&order).await {
 ## Retries and idempotency
 
 - Timeout per attempt: `ClientOptions::timeout` (default 10 s). Retries: `max_retries` (default 3; `Some(0)` turns them off), exponential backoff with full jitter, capped at 10 s.
-- Retried: connection errors, timeouts and responses with `retryable: true`.
+- Retried: connection errors, timeouts and responses with `retryable: true` (and 409
+  `CONCURRENT_MODIFICATION`). A 4xx is never retried except 429 and 409 `CONCURRENT_MODIFICATION`,
+  whatever its body says.
 - A 429 waits at least `Retry-After` / `details.retry_after_seconds`.
 - GETs retry freely.
 - **Orders:** safety rests on `client_order_id`, not on `Idempotency-Key` (the server does not honour

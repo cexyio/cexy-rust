@@ -298,7 +298,7 @@ impl fmt::Display for WsError {
 impl std::error::Error for WsError {}
 
 fn default_retryable(status: u16) -> bool {
-    matches!(status, 408 | 429 | 500 | 502 | 503 | 504)
+    matches!(status, 429 | 500 | 502 | 503 | 504)
 }
 
 /// Builds the API error for an error response. A known code maps by HTTP status; an unknown

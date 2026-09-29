@@ -145,6 +145,10 @@ async fn sub_account_balances_404_variants_are_not_found_with_one_request() {
         let (c, _) = client_with(&server, true, |_| {});
         let e = c.account().sub_account_balances("other").await.unwrap_err();
         assert!(e.is(ErrorCategory::NotFound), "case {i}: {e}");
+        if i < 2 {
+            // No retryable field / no JSON body: the status default applies.
+            assert!(!e.api().unwrap().retryable, "case {i}: {e}");
+        }
         assert_eq!(
             server.received_requests().await.unwrap().len(),
             1,

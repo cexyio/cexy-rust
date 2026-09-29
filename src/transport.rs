@@ -364,7 +364,6 @@ impl Transport {
     }
 }
 
-/// Percent-encodes one path segment (like encodeURIComponent: `/` becomes `%2F`).
 /// Whether `request` may retry `c`: reads, and the mutations that are safe to repeat: pool join
 /// and exit with their Idempotency-Key (the server honours it there), and cancel-all (naturally
 /// repeatable). The server ignores Idempotency-Key elsewhere, so no other mutation is retried.
@@ -375,6 +374,7 @@ fn repeat_safe(c: &Call) -> bool {
             && c.idempotency_key.is_some())
 }
 
+/// Percent-encodes one path segment (like encodeURIComponent: `/` becomes `%2F`).
 fn encode_segment(v: &str) -> String {
     let mut out = String::with_capacity(v.len());
     for b in v.bytes() {
