@@ -15,12 +15,12 @@ The official Rust SDK for the [CEXY.io](https://cexy.io) REST and WebSocket API.
 
 ```toml
 [dependencies]
-cexy = "=0.1.0-dev.4"
+cexy = "=0.1.0-dev.5"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
 Cargo never picks a pre-release (a version with `-dev.N`) on its own: name it explicitly. The
-exact requirement above (`=0.1.0-dev.4`) is the safest way; move it by hand for each new pre-release.
+exact requirement above (`=0.1.0-dev.5`) is the safest way; move it by hand for each new pre-release.
 
 ## Quick start: public data
 
@@ -282,6 +282,14 @@ the newest 256 updates to replay; older ones are dropped (`book.dropped_updates(
 **API-key authentication on the WebSocket is not available yet**: with an API key, use public channels
 and poll REST for private state. If the session is revoked, the client emits `WsEvent::AuthLost`;
 public channels keep working.
+
+The server ends private subscriptions, without any frame, when `auth` succeeds as another user,
+when an `auth` fails (any error signs the connection out), or when this connection's own session
+is revoked (`session.revoked` with `current: true`). The client emits `WsEvent::AuthChanged`
+(`AuthChange`: `reason` `UserChanged`, `AuthFailed` or `SessionRevoked`, plus the `dropped`
+channels) and re-subscribes those channels itself: at once for another user, after the next
+successful `auth` otherwise, followed by `WsEvent::Resync(ResyncReason::Reauth)` (refetch private
+state).
 
 ## Security
 

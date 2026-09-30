@@ -12,3 +12,4 @@ mod paths;
 mod redirect;
 mod trading;
 mod ws;
+mod ws_signout;

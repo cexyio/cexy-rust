@@ -17,36 +17,36 @@ use crate::{
 };
 
 /// One accepted connection: frames the client sent, and a way to send frames to it.
-struct Conn {
-    from_client: mpsc::UnboundedReceiver<Value>,
+pub(super) struct Conn {
+    pub(super) from_client: mpsc::UnboundedReceiver<Value>,
     to_client: mpsc::UnboundedSender<Message>,
     user_agent: Option<String>,
 }
 
 impl Conn {
-    async fn recv(&mut self) -> Value {
+    pub(super) async fn recv(&mut self) -> Value {
         tokio::time::timeout(Duration::from_secs(5), self.from_client.recv())
             .await
             .expect("a client frame")
             .expect("open")
     }
-    fn send(&self, v: Value) {
+    pub(super) fn send(&self, v: Value) {
         let _ = self.to_client.send(Message::text(v.to_string()));
     }
-    fn close(&self) {
+    pub(super) fn close(&self) {
         let _ = self.to_client.send(Message::Close(None));
     }
 }
 
 /// A local WebSocket server. It sends the welcome frame on connect and answers pings that
 /// carry an id; every other client frame is handed to the test.
-struct Server {
-    url: String,
+pub(super) struct Server {
+    pub(super) url: String,
     conns: mpsc::UnboundedReceiver<Conn>,
 }
 
 impl Server {
-    async fn start() -> Server {
+    pub(super) async fn start() -> Server {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!(
             "ws://127.0.0.1:{}/api/v1/ws",
@@ -112,7 +112,7 @@ impl Server {
         Server { url, conns }
     }
 
-    async fn conn(&mut self) -> Conn {
+    pub(super) async fn conn(&mut self) -> Conn {
         tokio::time::timeout(Duration::from_secs(5), self.conns.recv())
             .await
             .expect("a connection")
@@ -120,7 +120,7 @@ impl Server {
     }
 }
 
-fn options(url: &str) -> WsOptions {
+pub(super) fn options(url: &str) -> WsOptions {
     WsOptions {
         url: Some(url.to_string()),
         allow_insecure: true,

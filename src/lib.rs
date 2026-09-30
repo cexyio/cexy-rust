@@ -56,9 +56,9 @@ pub use services::{
 };
 pub use transport::RetryInfo;
 pub use ws::{
-    AuthResult, BookEvent, CloseInfo, DEFAULT_WEBSOCKET_URL, OrderBookUpdate, PRIVATE_CHANNELS,
-    ResyncReason, SUPPORTED_PROTOCOL_VERSION, SessionRevoked, SubscribeResult, WebSocket, Welcome,
-    WsEvent, WsEvents, WsFrame, WsOptions,
+    AuthChange, AuthChangeReason, AuthResult, BookEvent, CloseInfo, DEFAULT_WEBSOCKET_URL,
+    OrderBookUpdate, PRIVATE_CHANNELS, ResyncReason, SUPPORTED_PROTOCOL_VERSION, SessionRevoked,
+    SubscribeResult, WebSocket, Welcome, WsEvent, WsEvents, WsFrame, WsOptions,
 };
 
 /// SDK version.
