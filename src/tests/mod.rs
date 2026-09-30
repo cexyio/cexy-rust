@@ -12,4 +12,5 @@ mod paths;
 mod redirect;
 mod trading;
 mod ws;
+mod ws_live_balances;
 mod ws_signout;

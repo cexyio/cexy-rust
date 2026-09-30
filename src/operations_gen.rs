@@ -36,6 +36,8 @@ pub enum OperationId {
     ExportTrades,
     /// `export_withdrawals`
     ExportWithdrawals,
+    /// `get_account_id`
+    GetAccountId,
     /// `get_asset`
     GetAsset,
     /// `get_balance`
@@ -114,8 +116,8 @@ pub struct OperationInfo {
 }
 
 impl OperationId {
-    /// Every operation of the SDK surface (41).
-    pub const ALL: [OperationId; 41] = [
+    /// Every operation of the SDK surface (42).
+    pub const ALL: [OperationId; 42] = [
         OperationId::CancelAll,
         OperationId::CancelOrder,
         OperationId::DepositAddress,
@@ -126,6 +128,7 @@ impl OperationId {
         OperationId::ExportOrders,
         OperationId::ExportTrades,
         OperationId::ExportWithdrawals,
+        OperationId::GetAccountId,
         OperationId::GetAsset,
         OperationId::GetBalance,
         OperationId::GetCandles,
@@ -172,6 +175,7 @@ impl OperationId {
             OperationId::ExportOrders => "export_orders",
             OperationId::ExportTrades => "export_trades",
             OperationId::ExportWithdrawals => "export_withdrawals",
+            OperationId::GetAccountId => "get_account_id",
             OperationId::GetAsset => "get_asset",
             OperationId::GetBalance => "get_balance",
             OperationId::GetCandles => "get_candles",
@@ -266,6 +270,12 @@ impl OperationId {
             OperationId::ExportWithdrawals => OperationInfo {
                 method: "GET",
                 path: "/api/v1/exports/withdrawals",
+                auth: "api_key",
+                scope: "read",
+            },
+            OperationId::GetAccountId => OperationInfo {
+                method: "GET",
+                path: "/api/v1/account/id",
                 auth: "api_key",
                 scope: "read",
             },

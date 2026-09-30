@@ -228,6 +228,15 @@ pub struct Account<'a> {
 }
 
 impl<'a> Account<'a> {
+    /// The id of the account this API key belongs to (the same hex as the WebSocket's
+    /// `authenticated` user id). [`crate::WebSocket::live_balances`] uses it to check that REST
+    /// snapshots and WebSocket events belong to the same account.
+    pub async fn id(&self) -> Result<String> {
+        let r: crate::models_gen::AccountId =
+            self.c.get(Call::new(OperationId::GetAccountId)).await?;
+        Ok(r.user_id)
+    }
+
     /// Every balance.
     ///
     /// [`Balance::held_incoming`] lists incoming internal transfers still held. Their sum is

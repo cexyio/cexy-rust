@@ -7,7 +7,7 @@ use super::helpers::load;
 use super::ws::{Conn, Server, options};
 use crate::{AuthChangeReason, ResyncReason, WebSocket, WsEvent, WsEvents};
 
-fn sorted(v: &Value) -> Value {
+pub(super) fn sorted(v: &Value) -> Value {
     let mut out: Vec<String> = v
         .as_array()
         .map(|a| {
@@ -20,7 +20,7 @@ fn sorted(v: &Value) -> Value {
     json!(out)
 }
 
-fn norm_sent(m: &Value) -> Value {
+pub(super) fn norm_sent(m: &Value) -> Value {
     let mut o = Map::new();
     o.insert("op".into(), m["op"].clone());
     if let Some(t) = m.get("token") {
@@ -32,13 +32,15 @@ fn norm_sent(m: &Value) -> Value {
     Value::Object(o)
 }
 
-fn tracked(ev: WsEvent) -> Option<Value> {
+pub(super) fn tracked(ev: WsEvent) -> Option<Value> {
     match ev {
         WsEvent::AuthChanged(a) => {
             let reason = match a.reason {
                 AuthChangeReason::UserChanged => "user_changed",
                 AuthChangeReason::AuthFailed => "auth_failed",
                 AuthChangeReason::SessionRevoked => "session_revoked",
+                AuthChangeReason::TokenExpired => "token_expired",
+                AuthChangeReason::SignedOut => "signed_out",
             };
             let mut v = json!({"type": "auth_changed", "reason": reason, "previous_user_id": a.previous_user_id,
                                "user_id": a.user_id, "dropped": sorted(&json!(a.dropped))});
@@ -50,7 +52,11 @@ fn tracked(ev: WsEvent) -> Option<Value> {
         WsEvent::Resync(r) => Some(json!({"type": "resync", "reason": match r {
             ResyncReason::Reauth => "reauth",
             ResyncReason::Reconnect => "reconnect",
-            _ => "concurrent_modification",
+            ResyncReason::SequenceGap => "sequence_gap",
+            ResyncReason::BalancesResync => "balances_resync",
+            ResyncReason::DepositsResync => "deposits_resync",
+            ResyncReason::WithdrawalsResync => "withdrawals_resync",
+            ResyncReason::ConcurrentModification => "concurrent_modification",
         }})),
         WsEvent::AuthLost(_) => Some(json!({"type": "auth_lost"})),
         _ => None,
@@ -59,7 +65,7 @@ fn tracked(ev: WsEvent) -> Option<Value> {
 
 /// Two ping round trips: the client has handled every earlier frame, and everything it sent in
 /// reaction has reached the server.
-async fn settle(ws: &WebSocket, conn: &mut Conn, received: &mut Vec<Value>) {
+pub(super) async fn settle(ws: &WebSocket, conn: &mut Conn, received: &mut Vec<Value>) {
     ws.ping().await.unwrap();
     ws.ping().await.unwrap();
     while let Ok(m) = conn.from_client.try_recv() {
@@ -82,11 +88,18 @@ async fn private_signout_conformance() {
     let Some(spec) = load("ws/private_signout.json") else {
         return;
     };
-    let cases = spec["cases"].as_array().unwrap();
+    let server = load("ws/server_signout.json").unwrap();
+    let cases: Vec<Value> = spec["cases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .chain(server["cases"].as_array().unwrap())
+        .cloned()
+        .collect();
     assert!(!cases.is_empty());
     // Each case runs in its own task, so one failure does not hide the others.
     let mut failed = vec![];
-    for case in cases {
+    for case in &cases {
         let id = case["id"].as_str().unwrap().to_string();
         if tokio::spawn(run_case(case.clone())).await.is_err() {
             failed.push(id);

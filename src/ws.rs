@@ -18,6 +18,7 @@ use url::Url;
 use crate::amount::Amount;
 use crate::client::{Client, check_secure_url};
 use crate::error::{Error, Result, WsError};
+use crate::live_balances::LiveBalances;
 use crate::models_gen::ErrorCode;
 use crate::orderbook::{BookSnapshot, LiveOrderBook};
 
@@ -34,7 +35,7 @@ pub const PRIVATE_CHANNELS: [&str; 5] =
 const MAX_CHANNEL_LENGTH: usize = 64;
 const MAX_FRAME_SIZE: usize = 4 << 20;
 
-const KNOWN_EVENT_TYPES: [&str; 14] = [
+const KNOWN_EVENT_TYPES: [&str; 17] = [
     "ticker.update",
     "orderbook.update",
     "trade.new",
@@ -49,6 +50,9 @@ const KNOWN_EVENT_TYPES: [&str; 14] = [
     "deposit.completed",
     "withdrawal.updated",
     "session.revoked",
+    "balances.resync",
+    "deposits.resync",
+    "withdrawals.resync",
 ];
 
 /// The server's first frame on every connection.
@@ -171,6 +175,74 @@ pub enum ResyncReason {
     /// Private channels were re-subscribed after the server signed the connection out or
     /// switched it to another account: refetch private state through REST.
     Reauth,
+    /// A private channel skipped sequence numbers (see [`WsEvent::SequenceGap`]).
+    SequenceGap,
+    /// `balances.resync`: the server could not resume its balance change stream.
+    BalancesResync,
+    /// `deposits.resync` (planned server frame): refetch the deposit list.
+    DepositsResync,
+    /// `withdrawals.resync` (planned server frame): refetch the withdrawal list.
+    WithdrawalsResync,
+}
+
+/// Carried by [`WsEvent::SequenceGap`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SequenceGap {
+    /// The private channel.
+    pub channel: String,
+    /// The first missing sequence number.
+    pub expected: i64,
+    /// The number received instead.
+    pub received: i64,
+}
+
+/// A stoppable timer from a [`WsClock`].
+pub trait WsTimer: Send {
+    /// Stops the timer if it has not fired.
+    fn cancel(&self);
+}
+
+/// TEST-ONLY time source for the reorder-window timer and [`LiveBalances`] scheduling (minimum
+/// snapshot interval, retry backoff). Socket timeouts always use the real clock. Leave
+/// `WsOptions::clock` unset in production.
+pub trait WsClock: Send + Sync + std::fmt::Debug {
+    /// Time since an arbitrary fixed origin.
+    fn now(&self) -> Duration;
+    /// Runs `f` once after `delay`.
+    fn call_later(&self, delay: Duration, f: Box<dyn FnOnce() + Send>) -> Box<dyn WsTimer>;
+}
+
+#[derive(Debug)]
+struct RealClock(Instant);
+
+struct TaskTimer(tokio::task::AbortHandle);
+
+impl WsTimer for TaskTimer {
+    fn cancel(&self) {
+        self.0.abort();
+    }
+}
+
+impl WsClock for RealClock {
+    fn now(&self) -> Duration {
+        self.0.elapsed()
+    }
+    fn call_later(&self, delay: Duration, f: Box<dyn FnOnce() + Send>) -> Box<dyn WsTimer> {
+        let h = tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            f();
+        });
+        Box::new(TaskTimer(h.abort_handle()))
+    }
+}
+
+#[derive(Default)]
+struct SeqState {
+    next: i64,
+    holes: std::collections::BTreeSet<i64>,
+    first: Option<SequenceGap>,
+    timer: Option<Box<dyn WsTimer>>,
+    id: u64,
 }
 
 /// Why the server ended the connection's private subscriptions.
@@ -181,8 +253,14 @@ pub enum AuthChangeReason {
     UserChanged,
     /// An `auth` failed; the server signs the connection out on any auth error.
     AuthFailed,
-    /// This connection's own session was revoked (`session.revoked` with `current: true`).
+    /// This connection's own session was revoked (`session.revoked` with `current: true`, or
+    /// the `signed_out` frame with reason `revoked`).
     SessionRevoked,
+    /// the `signed_out` frame with reason `expired`. Re-send `auth` on every token refresh to
+    /// avoid it.
+    TokenExpired,
+    /// A server sign-out with a reason this SDK does not know (raw value in `code`).
+    SignedOut,
 }
 
 /// Carried by [`WsEvent::AuthChanged`].
@@ -194,7 +272,8 @@ pub struct AuthChange {
     pub previous_user_id: Option<String>,
     /// The new user ([`AuthChangeReason::UserChanged`]), otherwise `None`: signed out.
     pub user_id: Option<String>,
-    /// The server's error code ([`AuthChangeReason::AuthFailed`] only).
+    /// The server's error code ([`AuthChangeReason::AuthFailed`]), or the raw `signed_out` reason
+    /// ([`AuthChangeReason::SignedOut`]).
     pub code: Option<String>,
     /// Private channels the server dropped. They are re-subscribed automatically: at once for
     /// `UserChanged`, after the next successful `auth` otherwise (then
@@ -282,8 +361,14 @@ pub enum WsEvent {
     /// with a new token to restore private channels.
     AuthLost(WsFrame),
     /// The server ended this connection's private subscriptions: `auth` succeeded as another
-    /// user, an `auth` failed, or this connection's own session was revoked.
+    /// user, an `auth` failed, this connection's own session was revoked, or the server signed it
+    /// out (the `signed_out` frame).
     AuthChanged(AuthChange),
+    /// A private channel skipped sequence numbers on this connection (after the reorder window):
+    /// events were lost. Followed by `Resync(ResyncReason::SequenceGap)`.
+    SequenceGap(SequenceGap),
+    /// A [`LiveBalances`] changed state.
+    Balances(crate::live_balances::BalancesEvent),
     /// A live order book changed state.
     Book(BookEvent),
 }
@@ -326,6 +411,12 @@ pub struct WsOptions {
     /// dropped and counted in [`WebSocket::dropped_events`]; live order books still update.
     /// Default 10 000.
     pub event_buffer: usize,
+    /// Private channels with several publishers (orders, account) can deliver two adjacent frames
+    /// swapped: a missing sequence number gets this long to arrive before it counts as a gap.
+    /// Default 250 ms.
+    pub reorder_window: Duration,
+    /// TEST-ONLY: see [`WsClock`].
+    pub clock: Option<Arc<dyn WsClock>>,
 }
 
 impl Default for WsOptions {
@@ -345,6 +436,8 @@ impl Default for WsOptions {
             max_messages_per_minute: 200,
             user_agent: None,
             event_buffer: 10_000,
+            reorder_window: Duration::from_millis(250),
+            clock: None,
         }
     }
 }
@@ -364,7 +457,7 @@ pub(crate) struct State {
     channels: Vec<String>,
     pub(crate) token: Option<String>,
     /// The user of the last successful auth on the current connection.
-    auth_user_id: Option<String>,
+    pub(crate) auth_user_id: Option<String>,
     /// Private channels dropped by a server sign-out, re-subscribed after the next successful auth.
     pending_private: Vec<String>,
     pending: HashMap<String, Pending>,
@@ -376,6 +469,17 @@ pub(crate) struct State {
     window_count: u32,
     warned_version: bool,
     books: HashMap<String, LiveOrderBook>,
+    seq: HashMap<String, SeqState>,
+    seq_ids: u64,
+    pub(crate) live_balances: Vec<LiveBalances>,
+    pub(crate) balances_by_us: bool,
+}
+
+impl State {
+    /// Whether `c` is held, or pending re-subscription after a sign-out.
+    pub(crate) fn holds(&self, c: &str) -> bool {
+        self.channels.iter().any(|x| x == c) || self.pending_private.iter().any(|x| x == c)
+    }
 }
 
 pub(crate) struct Inner {
@@ -388,6 +492,7 @@ pub(crate) struct Inner {
     dropped: AtomicU64,
     connect_lock: tokio::sync::Mutex<()>,
     closing: Notify,
+    pub(crate) clock: Arc<dyn WsClock>,
 }
 
 /// The CEXY.io WebSocket client. Cloning is cheap; clones share the connection.
@@ -491,6 +596,10 @@ impl WebSocket {
         Ok(WebSocket {
             inner: Arc::new(Inner {
                 url,
+                clock: opts
+                    .clock
+                    .clone()
+                    .unwrap_or_else(|| Arc::new(RealClock(Instant::now()))),
                 opts,
                 snapshots,
                 st: Mutex::new(st),
@@ -539,6 +648,11 @@ impl WebSocket {
     /// revoked session are forgotten.
     pub fn has_token(&self) -> bool {
         self.inner.st.lock().unwrap().token.is_some()
+    }
+
+    /// The user of the last successful `auth` on the current connection (`None`: signed out).
+    pub fn user_id(&self) -> Option<String> {
+        self.inner.st.lock().unwrap().auth_user_id.clone()
     }
 
     /// Opens the connection and returns the server's welcome frame. After it succeeds, dropped
@@ -846,6 +960,7 @@ impl Inner {
             let r = s.ever_connected;
             s.ever_connected = true;
             s.auth_user_id = None; // a new connection starts signed out
+            Inner::reset_seq(&mut s, None); // sequences on a new connection are unrelated
             (
                 r,
                 s.token.clone(),
@@ -918,12 +1033,13 @@ impl Inner {
         Ok(string_list(ack.get("channels")))
     }
 
-    async fn unsubscribe(this: &Arc<Inner>, channels: Vec<String>) -> Result<()> {
+    pub(crate) async fn unsubscribe(this: &Arc<Inner>, channels: Vec<String>) -> Result<()> {
         let (held, connected) = {
             let mut s = this.st.lock().unwrap();
             let mut held = vec![];
             for c in uniq(channels) {
                 s.pending_private.retain(|x| x != &c);
+                Inner::reset_seq(&mut s, Some(&c));
                 if let Some(i) = s.channels.iter().position(|x| x == &c) {
                     s.channels.remove(i);
                     held.push(c);
@@ -1095,6 +1211,20 @@ impl Inner {
                 } else {
                     "unsubscribe"
                 };
+                if typ == "subscribed" {
+                    let helpers = {
+                        let mut s = this.st.lock().unwrap();
+                        for c in &channels {
+                            Inner::reset_seq(&mut s, Some(c)); // the next frame is the new baseline
+                        }
+                        s.live_balances.clone()
+                    };
+                    if channels.iter().any(|c| c == "balances") {
+                        for lb in helpers {
+                            lb.trigger("resubscribed");
+                        }
+                    }
+                }
                 match &id {
                     Some(id) => this.settle(id, Some(kind), Ok(value)),
                     None => this.settle_by_channel(kind, &channels, value), // acks that carry no id
@@ -1104,6 +1234,32 @@ impl Inner {
                 } else {
                     WsEvent::Unsubscribed(channels)
                 });
+            }
+            "signed_out" => {
+                // signed_out (a planned server frame): the server signed this connection out (token
+                // expired, session revoked, or a future reason). Private subscriptions are gone; a
+                // fresh auth on this socket restores them.
+                let raw = frame
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .filter(|r| !r.is_empty())
+                    .unwrap_or("unknown")
+                    .to_string();
+                this.st.lock().unwrap().token = None;
+                match raw.as_str() {
+                    "revoked" => {
+                        this.signed_out(AuthChangeReason::SessionRevoked, None);
+                        this.emit(WsEvent::AuthLost(WsFrame {
+                            r#type: "session.revoked".into(),
+                            channel: "account".into(),
+                            sequence: None,
+                            timestamp: None,
+                            data: json!({"session_id": null, "reason": "signed_out", "current": true}),
+                        }));
+                    }
+                    "expired" => this.signed_out(AuthChangeReason::TokenExpired, None),
+                    _ => this.signed_out(AuthChangeReason::SignedOut, Some(raw)),
+                }
             }
             "error" => {
                 let code = frame
@@ -1140,9 +1296,18 @@ impl Inner {
                 if code == ErrorCode::ConcurrentModification.as_str() && id.is_none() {
                     // The server dropped messages: resynchronise every book and channel.
                     this.emit(WsEvent::Resync(ResyncReason::ConcurrentModification));
-                    let books: Vec<_> = this.st.lock().unwrap().books.values().cloned().collect();
+                    let (books, helpers) = {
+                        let s = this.st.lock().unwrap();
+                        (
+                            s.books.values().cloned().collect::<Vec<_>>(),
+                            s.live_balances.clone(),
+                        )
+                    };
                     for b in books {
                         b.spawn_resync(0);
+                    }
+                    for lb in helpers {
+                        lb.trigger("concurrent_modification");
                     }
                 }
             }
@@ -1150,6 +1315,32 @@ impl Inner {
                 let Ok(ev) = serde_json::from_value::<WsFrame>(value) else {
                     return;
                 };
+                if PRIVATE_CHANNELS.contains(&ev.channel.as_str())
+                    && let Some(n) = ev.sequence
+                {
+                    Inner::track_seq(this, &ev.channel, n);
+                }
+                let resync = match ev.r#type.as_str() {
+                    "balances.resync" => Some(ResyncReason::BalancesResync),
+                    "deposits.resync" => Some(ResyncReason::DepositsResync),
+                    "withdrawals.resync" => Some(ResyncReason::WithdrawalsResync),
+                    _ => None,
+                };
+                if let Some(reason) = resync {
+                    this.emit(WsEvent::Event(ev));
+                    this.emit(WsEvent::Resync(reason));
+                    if reason == ResyncReason::BalancesResync {
+                        for lb in this.helpers() {
+                            lb.trigger("balances_resync");
+                        }
+                    }
+                    return;
+                }
+                if ev.r#type == "balance.updated" {
+                    for lb in this.helpers() {
+                        lb.on_event(&ev.data);
+                    }
+                }
                 // Only this connection's own session signs it out (the server checks
                 // current == true exactly); current false, missing or not a boolean changes
                 // nothing.
@@ -1183,6 +1374,95 @@ impl Inner {
         }
     }
 
+    fn helpers(&self) -> Vec<LiveBalances> {
+        self.st.lock().unwrap().live_balances.clone()
+    }
+
+    /// Forgets the sequence baseline of `channel` (all channels when `None`).
+    fn reset_seq(s: &mut State, channel: Option<&str>) {
+        let keys: Vec<String> = s
+            .seq
+            .keys()
+            .filter(|k| channel.is_none_or(|c| c == k.as_str()))
+            .cloned()
+            .collect();
+        for k in keys {
+            if let Some(st) = s.seq.remove(&k)
+                && let Some(t) = st.timer
+            {
+                t.cancel();
+            }
+        }
+    }
+
+    /// The first frame of a private channel is the baseline, a lower number is late (never a
+    /// gap), and a higher one opens holes that must fill within the reorder window.
+    fn track_seq(this: &Arc<Inner>, channel: &str, n: i64) {
+        let mut s = this.st.lock().unwrap();
+        s.seq_ids += 1;
+        let fresh_id = s.seq_ids;
+        let Some(st) = s.seq.get_mut(channel) else {
+            s.seq.insert(
+                channel.to_string(),
+                SeqState {
+                    next: n + 1,
+                    id: fresh_id,
+                    ..SeqState::default()
+                },
+            );
+            return;
+        };
+        if n < st.next {
+            if st.holes.remove(&n) && st.holes.is_empty() {
+                if let Some(t) = st.timer.take() {
+                    t.cancel();
+                }
+                st.first = None;
+            }
+            return;
+        }
+        if n > st.next && st.first.is_none() {
+            st.first = Some(SequenceGap {
+                channel: channel.to_string(),
+                expected: st.next,
+                received: n,
+            });
+        }
+        st.holes.extend(st.next..n);
+        st.next = n + 1;
+        if !st.holes.is_empty() && st.timer.is_none() {
+            let weak = Arc::downgrade(this);
+            let ch = channel.to_string();
+            let id = st.id;
+            st.timer = Some(this.clock.call_later(
+                this.opts.reorder_window,
+                Box::new(move || {
+                    let Some(inner) = weak.upgrade() else { return };
+                    let (gap, helpers) = {
+                        let mut s = inner.st.lock().unwrap();
+                        let Some(st) = s.seq.get_mut(&ch) else { return };
+                        if st.id != id || st.holes.is_empty() {
+                            return;
+                        }
+                        st.timer = None;
+                        st.holes.clear();
+                        let gap = st.first.take();
+                        (gap, s.live_balances.clone())
+                    };
+                    if let Some(g) = gap {
+                        inner.emit(WsEvent::SequenceGap(g));
+                    }
+                    inner.emit(WsEvent::Resync(ResyncReason::SequenceGap));
+                    if ch == "balances" {
+                        for lb in helpers {
+                            lb.trigger("sequence_gap");
+                        }
+                    }
+                }),
+            ));
+        }
+    }
+
     /// Moves the held private channels to the pending set and returns them.
     fn drop_private(s: &mut State) -> Vec<String> {
         let dropped: Vec<String> = s
@@ -1202,24 +1482,37 @@ impl Inner {
 
     /// The server signed the connection out and ended every private subscription.
     fn signed_out(&self, reason: AuthChangeReason, code: Option<String>) {
-        let change = {
+        let (change, helpers) = {
             let mut s = self.st.lock().unwrap();
-            AuthChange {
+            for c in PRIVATE_CHANNELS {
+                Inner::reset_seq(&mut s, Some(c));
+            }
+            let change = AuthChange {
                 reason,
                 previous_user_id: s.auth_user_id.take(),
                 user_id: None,
                 code,
                 dropped: Inner::drop_private(&mut s),
-            }
+            };
+            (change, s.live_balances.clone())
         };
+        for lb in helpers {
+            lb.on_auth_changed(reason);
+        }
         self.emit(WsEvent::AuthChanged(change));
     }
 
     /// A successful auth: detects an account switch, then restores the pending private channels.
     fn on_authenticated(this: &Arc<Inner>, user_id: Option<String>) {
-        let (change, channels) = {
+        let (change, channels, helpers) = {
             let mut s = this.st.lock().unwrap();
             let previous = std::mem::replace(&mut s.auth_user_id, user_id.clone());
+            let switched = previous.is_some() && previous != user_id;
+            if switched {
+                for c in PRIVATE_CHANNELS {
+                    Inner::reset_seq(&mut s, Some(c));
+                }
+            }
             let change = match previous {
                 Some(prev) if user_id.as_ref() != Some(&prev) => Some(AuthChange {
                     reason: AuthChangeReason::UserChanged,
@@ -1232,9 +1525,12 @@ impl Inner {
             };
             let channels = std::mem::take(&mut s.pending_private);
             s.channels.extend(channels.iter().cloned());
-            (change, channels)
+            (change, channels, s.live_balances.clone())
         };
         if let Some(c) = change {
+            for lb in &helpers {
+                lb.on_auth_changed(AuthChangeReason::UserChanged);
+            }
             this.emit(WsEvent::AuthChanged(c));
         }
         if channels.is_empty() {
@@ -1284,6 +1580,9 @@ impl Inner {
         };
         for b in books {
             b.mark_disconnected(); // sequences reset per connection
+        }
+        for lb in this.helpers() {
+            lb.mark_stale(); // the re-subscribe after the reconnect takes a new snapshot
         }
         this.emit(WsEvent::Close(CloseInfo {
             code,
@@ -1356,6 +1655,7 @@ impl Inner {
             }
             s.closed_by_user = true;
             s.auth_user_id = None;
+            Inner::reset_seq(&mut s, None);
             let was_open = s.out.is_some();
             Inner::teardown(
                 &mut s,
@@ -1366,6 +1666,9 @@ impl Inner {
         this.closing.notify_waiters();
         for b in books {
             b.mark_disconnected();
+        }
+        for lb in this.helpers() {
+            lb.mark_stale(); // no connection: nothing is live any more
         }
         if was_open {
             this.emit(WsEvent::Close(CloseInfo {
