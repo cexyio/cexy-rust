@@ -6,6 +6,12 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+- `LiveBalances`: events that arrived while the owner lookup was in flight are dropped when the
+  lookup ends in `AccountMismatch` (they were kept until the next snapshot).
+- CHANGELOG 0.1.0-dev.6: the owner check is described as it works (at the start and after every
+  account change).
+
 ## [0.1.0-dev.6] (2026-09-30)
 
 ### Added
@@ -14,8 +20,8 @@ All notable changes to this project are documented here. The format follows
   `balance.updated` events. An event applies only when its `sequence` is greater than the stored
   one (a total of 0 removes the row, and an older snapshot row cannot bring it back); a refetch
   happens on a missed event, `balances.resync`, `CONCURRENT_MODIFICATION`, a reconnect or an account
-  change, at most every `min_snapshot_interval` (default 2 s), with retry backoff. Before every
-  merge the REST key's account (`Account::id`) must be the WebSocket's user, otherwise nothing is
+  change, at most every `min_snapshot_interval` (default 2 s), with retry backoff. At the start and after
+  every account change the REST key's account (`Account::id`) must be the WebSocket's user, otherwise nothing is
   merged (`BalancesEvent::AccountMismatch`). A custom `snapshot` must name its owner (`owner_id` or `account_id`),
   otherwise `live_balances` fails with a `CONFIG` error. Events without `sequence` (older servers) always apply
   and emit one `WsEvent::Warning`. `is_stale`, `last_error`, `get`, `all`, `close`; events through

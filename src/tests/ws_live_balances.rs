@@ -600,3 +600,54 @@ async fn signed_out_auth_lost_payload_and_unknown_reason() {
     assert_eq!(last.code.as_deref(), Some("unknown"));
     ws.close().await;
 }
+
+#[tokio::test]
+async fn owner_lookup_events_dropped_on_mismatch() {
+    let mut srv = Server::start().await;
+    let (ws, _rx, mut c) = authed_ws(&mut srv, None).await;
+    let (tx, rx) = oneshot::channel::<String>();
+    let rx = Arc::new(tokio::sync::Mutex::new(Some(rx)));
+    let owner_fn: crate::OwnerIdFn =
+        Arc::new(move || -> BoxFuture<'static, crate::Result<String>> {
+            let rx = rx.clone();
+            Box::pin(async move {
+                let r = rx.lock().await.take().expect("one lookup");
+                Ok(r.await.unwrap())
+            })
+        });
+    let snap: crate::BalanceSnapshotFn =
+        Arc::new(|| -> BoxFuture<'static, crate::Result<Vec<Balance>>> {
+            Box::pin(async { Ok(vec![]) })
+        });
+    let ws2 = ws.clone();
+    let h = tokio::spawn(async move {
+        ws2.live_balances(LiveBalancesOptions {
+            snapshot: Some(snap),
+            owner_id: Some(owner_fn),
+            ..Default::default()
+        })
+        .await
+    });
+    let req = c.recv().await;
+    c.send(json!({"type": "subscribed", "channels": ["balances"], "id": req["id"]}));
+    let lb = h.await.unwrap().unwrap();
+    for i in 0..5 {
+        c.send(json!({"type": "balance.updated", "channel": "balances",
+            "data": {"asset": "USDT", "available": "1", "locked": "0", "pending": "0", "total": "1", "sequence": i + 1}}));
+    }
+    ws.ping().await.unwrap();
+    assert_eq!(lb.buffered_events(), 5); // held while the owner lookup is in flight
+    tx.send("someone_else".into()).unwrap();
+    for _ in 0..400 {
+        if lb.last_error().is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        lb.last_error().map(|e| e.code),
+        Some("ACCOUNT_MISMATCH".to_string())
+    );
+    assert_eq!(lb.buffered_events(), 0);
+    ws.close().await;
+}

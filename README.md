@@ -327,7 +327,9 @@ It refetches by itself on a missed event, `balances.resync`, `CONCURRENT_MODIFIC
 or an account change, at most every `min_snapshot_interval` (default 2 s; `Duration::ZERO`: none),
 and never because a balance's own sequence skipped values. At the start and after every account change it checks that the
 REST key's account (`account().id()`) is the WebSocket's authenticated user: otherwise nothing is
-merged (`BalancesEvent::AccountMismatch`, and `last_error()` has code `ACCOUNT_MISMATCH`).
+merged (`BalancesEvent::AccountMismatch`, and `last_error()` has code `ACCOUNT_MISMATCH`). With your
+own `snapshot` source, also pass its owner (`owner_id` or `account_id`); without one,
+`live_balances` fails with a `CONFIG` error.
 
 ## Security
 
