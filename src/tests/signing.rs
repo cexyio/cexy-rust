@@ -152,6 +152,92 @@ fn never_prints_the_secret() {
     assert!(!r.contains(SECRET) && !r.contains(KEY), "{r}");
 }
 
+// An independent canonicaliser, written from the spec text (not the SDK's code): regex decoding
+// and a table encoder, so the raw server catches canonicalisation bugs too.
+fn indep_enc(s: &str) -> String {
+    let re = regex::bytes::Regex::new("%([0-9A-Fa-f]{2})").unwrap();
+    let raw = re.replace_all(s.as_bytes(), |c: &regex::bytes::Captures<'_>| {
+        vec![u8::from_str_radix(std::str::from_utf8(&c[1]).unwrap(), 16).unwrap()]
+    });
+    const UNRESERVED: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~";
+    raw.iter()
+        .map(|b| {
+            if UNRESERVED.contains(b) {
+                (*b as char).to_string()
+            } else {
+                format!("%{b:02X}")
+            }
+        })
+        .collect()
+}
+
+fn indep_path(p: &str) -> String {
+    p.split('/').map(indep_enc).collect::<Vec<_>>().join("/")
+}
+
+fn indep_query(q: &str) -> String {
+    let mut pairs: Vec<(String, String)> = q
+        .split('&')
+        .filter(|p| !p.is_empty())
+        .map(|p| {
+            let (n, v) = p.split_once('=').unwrap_or((p, ""));
+            (indep_enc(n), indep_enc(v))
+        })
+        .collect();
+    pairs.sort_by(|a, b| {
+        a.0.as_bytes()
+            .cmp(b.0.as_bytes())
+            .then(a.1.as_bytes().cmp(b.1.as_bytes()))
+    });
+    pairs
+        .iter()
+        .map(|(n, v)| format!("{n}={v}"))
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
+fn indep_canonical(method: &str, target: &str, ts: &str, nonce: &str, body: &[u8]) -> String {
+    let (path, query) = split_target(target);
+    let sum: String = ring::digest::digest(&ring::digest::SHA256, body)
+        .as_ref()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    [
+        "CEXY-HMAC-SHA256-v1",
+        method,
+        &indep_path(path),
+        &indep_query(query),
+        ts,
+        nonce,
+        &sum,
+    ]
+    .join("\n")
+}
+
+#[test]
+fn independent_canonicaliser_agrees_with_vectors() {
+    let Some(v) = load("signing/vectors.json") else {
+        return;
+    };
+    let (ts, nonce) = (
+        v["timestamp"].as_str().unwrap(),
+        v["nonce"].as_str().unwrap(),
+    );
+    for c in v["rest"].as_array().unwrap() {
+        let target = c["request_target"].as_str().unwrap();
+        let body = c["body"].as_str().unwrap().as_bytes();
+        let got = indep_canonical(c["method"].as_str().unwrap(), target, ts, nonce, body);
+        assert_eq!(got, c["canonical_request"], "{}", c["name"]);
+    }
+}
+
+#[test]
+fn query_rules() {
+    assert_eq!(canonical_query("a=1&&b=2&"), "a=1&b=2"); // empty parts are dropped
+    assert_eq!(canonical_query("?a=1"), "%3Fa=1"); // a "?" inside the query is data
+}
+
 /// What the raw server saw.
 #[derive(Debug, Clone)]
 struct Seen {
@@ -205,11 +291,9 @@ async fn raw_server(reply: Reply) -> (String, Arc<Mutex<Vec<Seen>>>) {
                         let body = buf[end + 4..end + 4 + len].to_vec();
                         buf.drain(..end + 4 + len);
                         let h = |k: &str| headers.get(k).cloned().unwrap_or_default();
-                        let (path, query) = split_target(&target);
-                        let canonical = canonical_request(
+                        let canonical = indep_canonical(
                             &method,
-                            path,
-                            query,
+                            &target,
                             &h("x-api-timestamp"),
                             &h("x-api-nonce"),
                             &body,
@@ -443,6 +527,7 @@ struct KeyAuthWs {
     conns: Arc<Mutex<Vec<tokio::sync::mpsc::UnboundedSender<Message>>>>,
     refuse: Arc<std::sync::atomic::AtomicBool>,
     silent: Arc<std::sync::atomic::AtomicBool>,
+    held: Arc<Mutex<Option<Value>>>,
 }
 
 impl KeyAuthWs {
@@ -458,22 +543,25 @@ impl KeyAuthWs {
             conns: Arc::default(),
             refuse: Arc::default(),
             silent: Arc::default(),
+            held: Arc::default(),
         };
-        let (auth_keys, conns, refuse, silent) = (
+        let (auth_keys, conns, refuse, silent, held) = (
             s.auth_keys.clone(),
             s.conns.clone(),
             s.refuse.clone(),
             s.silent.clone(),
+            s.held.clone(),
         );
         let issued = Arc::new(AtomicUsize::new(0));
         let signed = Arc::new(Mutex::new(HashSet::<String>::new()));
         tokio::spawn(async move {
             while let Ok((tcp, _)) = listener.accept().await {
-                let (auth_keys, conns, refuse, silent, issued, signed) = (
+                let (auth_keys, conns, refuse, silent, held, issued, signed) = (
                     auth_keys.clone(),
                     conns.clone(),
                     refuse.clone(),
                     silent.clone(),
+                    held.clone(),
                     issued.clone(),
                     signed.clone(),
                 );
@@ -515,14 +603,15 @@ impl KeyAuthWs {
                                             let ok = v["key_id"] == KEY && v["signature"] == want.as_str() && fresh
                                                 && !refuse.load(Ordering::SeqCst);
                                             challenge = next();
-                                            if silent.load(Ordering::SeqCst) {
-                                                continue;
-                                            }
                                             let reply = if ok {
                                                 json!({"type": "authenticated", "user_id": "u1", "auth": "api_key", "challenge": challenge, "id": v["id"]})
                                             } else {
                                                 json!({"type": "error", "code": "UNAUTHENTICATED", "message": "bad key signature", "challenge": challenge, "id": v["id"]})
                                             };
+                                            if silent.load(Ordering::SeqCst) {
+                                                *held.lock().unwrap() = Some(reply); // sent late, see release()
+                                                continue;
+                                            }
                                             let _ = sink.send(Message::text(reply.to_string())).await;
                                         }
                                         _ => {}
@@ -550,6 +639,12 @@ impl KeyAuthWs {
     fn drop_last(&self) {
         let c = self.conns.lock().unwrap().last().cloned().unwrap();
         let _ = c.send(Message::Close(None));
+    }
+
+    /// Sends the held auth_key reply late, on the latest connection.
+    fn release(&self) {
+        let v = self.held.lock().unwrap().take().expect("a held reply");
+        self.push_last(v);
     }
 
     fn push_last(&self, v: Value) {
@@ -661,25 +756,157 @@ async fn a_refused_auth_key_stops_reauth() {
 #[tokio::test]
 async fn a_late_auth_key_reply_racing_a_reconnect() {
     let server = KeyAuthWs::start().await;
-    let ws = key_auth_ws(&server, AuthScheme::Hmac, Duration::from_millis(300));
+    let ws = key_auth_ws(&server, AuthScheme::Hmac, Duration::from_millis(100));
     ws.connect().await.unwrap();
-    server.silent.store(true, Ordering::SeqCst); // the reply never comes on this connection
-    let ws2 = ws.clone();
-    let pending = tokio::spawn(async move { ws2.auth_key().await });
-    eventually("auth_key sent", || server.sent().len() == 1).await;
+    server.silent.store(true, Ordering::SeqCst); // the reply is held back
+    assert!(ws.auth_key().await.is_err(), "expected a timeout");
     server.silent.store(false, Ordering::SeqCst);
-    server.drop_last();
+    server.release(); // the late reply (with its next challenge) arrives ...
+    server.drop_last(); // ... as the connection drops
     eventually("re-auth on the new connection", || {
         server.conn_count() == 2 && server.sent().len() == 2
     })
     .await;
-    let _ = pending.await;
+    // The server accepts only the new welcome's challenge: signing the late reply's fails.
     eventually("authenticated", || ws.user_id().as_deref() == Some("u1")).await;
     let s = server.sent();
-    assert_ne!(
-        s[0]["signature"], s[1]["signature"],
-        "the old challenge was signed again"
+    assert_ne!(s[0]["signature"], s[1]["signature"]);
+}
+
+#[tokio::test]
+async fn a_challenge_is_consumed_when_signed() {
+    let server = KeyAuthWs::start().await;
+    let ws = key_auth_ws(&server, AuthScheme::Hmac, Duration::from_millis(100));
+    ws.connect().await.unwrap();
+    server.silent.store(true, Ordering::SeqCst);
+    let e = ws.auth_key().await.unwrap_err();
+    assert!(
+        matches!(&e, Error::WebSocket(w) if w.code == "TIMEOUT"),
+        "{e}"
     );
+    let e = ws.auth_key().await.unwrap_err();
+    assert!(
+        matches!(&e, Error::WebSocket(w) if w.code == "NO_CHALLENGE"),
+        "{e}"
+    );
+    assert_eq!(server.sent().len(), 1);
+}
+
+#[tokio::test]
+async fn a_late_refusal_stops_automatic_key_reauth() {
+    let server = KeyAuthWs::start().await;
+    let ws = key_auth_ws(&server, AuthScheme::Hmac, Duration::from_millis(100));
+    ws.connect().await.unwrap();
+    server.silent.store(true, Ordering::SeqCst);
+    assert!(ws.auth_key().await.is_err());
+    let id = server.sent()[0]["id"].clone();
+    server.push_last(json!({"type": "error", "code": "UNAUTHENTICATED", "message": "bad key", "challenge": "late", "id": id}));
+    eventually("key auth cleared", || !ws.inner.st.lock().unwrap().key_auth).await;
+    server.silent.store(false, Ordering::SeqCst);
+    server.drop_last();
+    eventually("reconnect", || {
+        server.conn_count() == 2 && ws.is_connected()
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        server.sent().len(),
+        1,
+        "a late refusal must stop the automatic re-auth"
+    );
+}
+
+/// Blocks its first real signature until released (a KMS or HSM).
+struct SlowSigner {
+    inner: HmacAuthenticator,
+    gate: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    calls: AtomicUsize,
+}
+
+impl Authenticator for SlowSigner {
+    fn kind(&self) -> &str {
+        "slow"
+    }
+    fn authenticate(&self, request: &mut AuthRequest<'_>) -> crate::Result<()> {
+        self.inner.authenticate(request)
+    }
+    fn redact(&self, text: &str) -> String {
+        self.inner.redact(text)
+    }
+    fn sign_websocket_challenge(
+        &self,
+        connection_id: &str,
+        challenge: &str,
+    ) -> Option<(String, String)> {
+        if !challenge.is_empty() && self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            let rx = self.gate.lock().unwrap().take().unwrap();
+            let _ = rx.recv();
+        }
+        self.inner
+            .sign_websocket_challenge(connection_id, challenge)
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_slow_signer_racing_a_reconnect_never_sends_a_stale_signature() {
+    let server = KeyAuthWs::start().await;
+    let (tx, rx) = std::sync::mpsc::channel();
+    let slow = Arc::new(SlowSigner {
+        inner: HmacAuthenticator::new(KEY, SECRET).unwrap(),
+        gate: Mutex::new(Some(rx)),
+        calls: AtomicUsize::new(0),
+    });
+    let c = Client::new(ClientOptions {
+        authenticator: Some(slow.clone()),
+        base_url: Some("http://127.0.0.1:1".into()),
+        allow_insecure: true,
+        ..Default::default()
+    })
+    .unwrap();
+    let ws = c
+        .websocket(WsOptions {
+            url: Some(server.url.clone()),
+            reconnect_base_delay: Duration::from_millis(10),
+            reconnect_max_delay: Duration::from_millis(20),
+            ..Default::default()
+        })
+        .unwrap();
+    ws.connect().await.unwrap();
+    let ws2 = ws.clone();
+    let pending = tokio::spawn(async move { ws2.auth_key().await });
+    eventually("signing started", || slow.calls.load(Ordering::SeqCst) == 1).await;
+    server.drop_last(); // the connection changes while the signer works
+    eventually("re-auth on the new connection", || {
+        server.conn_count() == 2 && ws.user_id().as_deref() == Some("u1")
+    })
+    .await;
+    tx.send(()).unwrap();
+    let e = pending.await.unwrap().unwrap_err();
+    assert!(
+        matches!(&e, Error::WebSocket(w) if w.code == "STALE_CHALLENGE"),
+        "{e}"
+    );
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        server.sent().len(),
+        1,
+        "the stale signature must never be sent"
+    );
+}
+
+#[tokio::test]
+async fn signature_expired_without_server_time_is_returned_as_is() {
+    let (base, seen) = raw_server(Arc::new(|_: &Seen, _| {
+        api_err("SIGNATURE_EXPIRED", json!({}))
+    }))
+    .await;
+    let (c, a) = signing_client(&base);
+    let e = c.account().balances().await.unwrap_err();
+    let api = e.api().unwrap();
+    assert_eq!(api.code.as_str(), "SIGNATURE_EXPIRED");
+    assert!(!api.message.contains("clock"), "{e}");
+    assert_eq!(seen.lock().unwrap().len(), 1);
+    assert_eq!(a.clock_offset_ms(), 0);
 }
 
 #[tokio::test]

@@ -23,15 +23,17 @@ All notable changes to this project are documented here. The format follows
   automatic key re-auth after a refused key, and reports `AuthChangeReason::KeyRevoked` /
   `KeyExpired` sign-outs. It needs a WebSocket from `Client::websocket` on an `AuthScheme::Hmac`
   client. `AuthResult::auth` says how the connection is authenticated; `Welcome::challenge` is the
-  challenge.
+  challenge. A signature that finishes after the connection changed is dropped (`STALE_CHALLENGE`);
+  the new connection signs its own challenge.
 
 ### Changed
 - Path values and query strings are encoded per RFC 3986 with uppercase hex (a space is `%20`,
   not `+`; `!*'()` in path values are encoded too). The server decodes both forms the same way; this
   makes the signed request exactly the sent one.
 - Frames that arrive from a connection already replaced by a reconnect are ignored.
-- `Welcome` and `AuthResult` have a new public field each; code that builds them with struct
-  literals must set it.
+- `ClientOptions` has a new public field, `auth`, and `Welcome` and `AuthResult` have one each.
+  Code that builds them with a full struct literal (without `..Default::default()` /
+  `..ClientOptions::with_api_key(..)`) must set it.
 
 ### Fixed
 - `LiveBalances`: events that arrived while the owner lookup was in flight are dropped when the

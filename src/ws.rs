@@ -1,7 +1,7 @@
 //! The WebSocket client: heartbeat, liveness, subscriptions with local limits, automatic
 //! reconnect with re-auth and re-subscribe, and live order books.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
@@ -472,7 +472,10 @@ pub(crate) struct State {
     /// The latest unused `auth_key` challenge (from the welcome or the last `auth_key` reply).
     challenge: Option<String>,
     /// `auth_key` is the active credential: re-signed after each reconnect.
-    key_auth: bool,
+    pub(crate) key_auth: bool,
+    /// Ids of `auth_key` requests sent on the current connection: a refusal that arrives after the
+    /// timeout still stops the automatic key re-authentication.
+    auth_key_ids: HashSet<String>,
     /// The user of the last successful auth on the current connection.
     pub(crate) auth_user_id: Option<String>,
     /// Private channels dropped by a server sign-out, re-subscribed after the next successful auth.
@@ -1009,6 +1012,7 @@ impl Inner {
             s.auth_user_id = None; // a new connection starts signed out
             Inner::reset_seq(&mut s, None); // sequences on a new connection are unrelated
             s.challenge = welcome.challenge.clone();
+            s.auth_key_ids.clear();
             (
                 r,
                 (s.token.clone(), s.key_auth),
@@ -1079,11 +1083,15 @@ impl Inner {
     }
 
     async fn auth_key(this: &Arc<Inner>) -> Result<AuthResult> {
-        let (challenge, connection_id) = {
+        let (challenge, connection_id, generation) = {
             let mut s = this.st.lock().unwrap();
             // A challenge is signed at most once.
             let c = s.challenge.take();
-            (c, s.welcome.as_ref().map(|w| w.connection_id.clone()))
+            (
+                c,
+                s.welcome.as_ref().map(|w| w.connection_id.clone()),
+                s.conn_gen,
+            )
         };
         let (Some(challenge), Some(connection_id)) = (challenge, connection_id) else {
             return Err(WsError::local(
@@ -1098,6 +1106,15 @@ impl Inner {
         else {
             return Err(Error::config("auth_key: the client cannot sign"));
         };
+        // A custom signer may be slow (a KMS or HSM): if the connection changed meanwhile, the
+        // signature is for the old one. Drop it; the new connection signs its own challenge.
+        if this.st.lock().unwrap().conn_gen != generation {
+            return Err(WsError::local(
+                "STALE_CHALLENGE",
+                "auth_key: the connection changed while signing; the new connection authenticates itself",
+            )
+            .into());
+        }
         let mut payload = Map::new();
         payload.insert("key_id".into(), Value::String(key_id));
         payload.insert("signature".into(), Value::String(signature));
@@ -1153,6 +1170,9 @@ impl Inner {
             let id = s.next_id.to_string();
             s.next_id += 1;
             s.pending.insert(id.clone(), Pending { kind, channels, tx });
+            if kind == "auth_key" {
+                s.auth_key_ids.insert(id.clone());
+            }
             id
         };
         payload.insert("op".into(), Value::String(kind.to_string()));
@@ -1378,7 +1398,10 @@ impl Inner {
                 if let Some(id) = &id {
                     // Any error on an auth frame signs the connection out (an UNAUTHENTICATED
                     // error on a subscribe is only a refused subscribe).
-                    let kind = this.pending_kind(id);
+                    let mut kind = this.pending_kind(id);
+                    if kind.is_none() && this.st.lock().unwrap().auth_key_ids.remove(id) {
+                        kind = Some("auth_key"); // a refusal that arrived after the timeout
+                    }
                     if kind == Some("auth_key") {
                         // A refused key is not tried again automatically.
                         this.st.lock().unwrap().key_auth = false;

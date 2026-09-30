@@ -70,14 +70,13 @@ pub(crate) fn canonical_path(path: &str) -> String {
         .join("/")
 }
 
-/// Canonical query: split on `&`; decode and re-encode names and values; sort bytewise.
+/// Canonical query: split on `&` (empty parts dropped); decode and re-encode names and values;
+/// sort bytewise. `query` is everything after the FIRST `?` of the request target, so a further
+/// `?` is data.
 pub(crate) fn canonical_query(query: &str) -> String {
-    let q = query.strip_prefix('?').unwrap_or(query);
-    if q.is_empty() {
-        return String::new();
-    }
-    let mut pairs: Vec<(String, String)> = q
+    let mut pairs: Vec<(String, String)> = query
         .split('&')
+        .filter(|part| !part.is_empty()) // "a=1&&b=2" is "a=1&b=2"
         .map(|part| {
             let (name, value) = part.split_once('=').unwrap_or((part, ""));
             (
