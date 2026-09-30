@@ -6,6 +6,33 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- Request signing, **planned** (the API does not accept it yet; the default is unchanged):
+  `ClientOptions { auth: AuthScheme::Hmac, ..ClientOptions::with_api_key(key, secret) }` signs every
+  private request (`CEXY-HMAC-SHA256-v1`: `X-API-Key`, `X-API-Timestamp`, `X-API-Nonce`,
+  `X-API-Signature`) instead of sending `X-API-Secret`. Every attempt, retries included, is signed
+  with a fresh timestamp and nonce. After `SIGNATURE_EXPIRED` the client adopts the server clock (at
+  most 1 h away) and resends once. `KEY_NOT_SIGNABLE` (a key issued before signing) is an error
+  that names the fix; there is no fallback to `X-API-Secret`. Checked against the spec's signing
+  vectors and a raw test server that verifies every signature from the request line and body it
+  received. `HmacAuthenticator`, `SIGNING_SCHEME` and `MAX_CLOCK_OFFSET` are exported; the
+  `Authenticator` trait gains `adjust_clock` and `sign_websocket_challenge`, with defaults.
+  `ring` (already used through rustls) is now a direct dependency for HMAC, SHA-256 and the nonce.
+- `WebSocket::auth_key`, **planned**: authenticates with the client's API key by signing the
+  server's single-use challenge. It re-signs the new challenge after each reconnect, stops
+  automatic key re-auth after a refused key, and reports `AuthChangeReason::KeyRevoked` /
+  `KeyExpired` sign-outs. It needs a WebSocket from `Client::websocket` on an `AuthScheme::Hmac`
+  client. `AuthResult::auth` says how the connection is authenticated; `Welcome::challenge` is the
+  challenge.
+
+### Changed
+- Path values and query strings are encoded per RFC 3986 with uppercase hex (a space is `%20`,
+  not `+`; `!*'()` in path values are encoded too). The server decodes both forms the same way; this
+  makes the signed request exactly the sent one.
+- Frames that arrive from a connection already replaced by a reconnect are ignored.
+- `Welcome` and `AuthResult` have a new public field each; code that builds them with struct
+  literals must set it.
+
 ### Fixed
 - `LiveBalances`: events that arrived while the owner lookup was in flight are dropped when the
   lookup ends in `AccountMismatch` (they were kept until the next snapshot).

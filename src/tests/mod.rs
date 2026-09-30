@@ -10,6 +10,7 @@ mod models;
 mod pagination;
 mod paths;
 mod redirect;
+mod signing;
 mod trading;
 mod ws;
 mod ws_live_balances;

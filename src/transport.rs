@@ -15,6 +15,7 @@ use crate::error::{
 };
 use crate::limiter::RateLimiter;
 use crate::operations_gen::OperationId;
+use crate::signing::{encode_bytes, encode_query};
 
 const BACKOFF_BASE: Duration = Duration::from_millis(500);
 const BACKOFF_MAX: Duration = Duration::from_secs(10);
@@ -179,8 +180,45 @@ impl Transport {
         Duration::from_nanos(((self.random)() * capped.as_nanos() as f64).ceil() as u64)
     }
 
-    /// One try: rate limiter, credentials, timeout, error mapping. No retries.
+    /// One try (plus, with request signing, one re-signed resend after `SIGNATURE_EXPIRED` once
+    /// the clock is corrected; it is outside the retry budget). `KEY_NOT_SIGNABLE` names the fix;
+    /// there is no fallback to another scheme.
     pub(crate) async fn attempt(&self, c: &Call, o: &Resolved) -> Result<Raw> {
+        let mut e = match self.attempt_once(c, o).await {
+            Err(Error::Api(e)) => e,
+            other => return other,
+        };
+        if e.code.as_str() == "KEY_NOT_SIGNABLE" {
+            e.message =
+                "create a new API key; keys issued before request signing can't sign".into();
+            e.retryable = false;
+            return Err(Error::Api(e));
+        }
+        if e.code.as_str() != "SIGNATURE_EXPIRED" {
+            return Err(Error::Api(e));
+        }
+        let server_ms = e
+            .details
+            .get("server_time_ms")
+            .and_then(|v| v.as_i64().or_else(|| v.as_f64().map(|f| f as i64)));
+        let adjusted = match (&self.auth, server_ms) {
+            (Some(auth), Some(ms)) => auth.adjust_clock(ms),
+            _ => None,
+        };
+        match adjusted {
+            // Signed again with the corrected clock, once.
+            Some(true) => self.attempt_once(c, o).await,
+            Some(false) => {
+                e.message = "the local clock is more than 1 hour away from the server's: fix the system clock".into();
+                e.retryable = false;
+                Err(Error::Api(e))
+            }
+            None => Err(Error::Api(e)), // not a signing scheme
+        }
+    }
+
+    /// One try: rate limiter, credentials, timeout, error mapping. No retries.
+    async fn attempt_once(&self, c: &Call, o: &Resolved) -> Result<Raw> {
         let info = c.op.info();
         let url = self.build_url(c)?;
         if info.auth == "api_key" && self.auth.is_none() {
@@ -347,11 +385,10 @@ impl Transport {
         let mut url = Url::parse(&format!("{}{}", self.base_url, path)).map_err(|e| {
             Error::config(format!("{} {}: invalid URL: {e}", info.method, info.path))
         })?;
+        // RFC 3986 (%20 for a space), not form encoding (+ for a space): the query that is
+        // signed is exactly the query that is sent.
         if !c.query.is_empty() {
-            let mut q = url.query_pairs_mut();
-            for (k, v) in &c.query {
-                q.append_pair(k, v);
-            }
+            url.set_query(Some(&encode_query(&c.query)));
         }
         Ok(url)
     }
@@ -374,17 +411,10 @@ fn repeat_safe(c: &Call) -> bool {
             && c.idempotency_key.is_some())
 }
 
-/// Percent-encodes one path segment (like encodeURIComponent: `/` becomes `%2F`).
+/// Percent-encodes one path segment per RFC 3986 with uppercase hex (`/` becomes `%2F`): what
+/// is sent is what is signed.
 fn encode_segment(v: &str) -> String {
-    let mut out = String::with_capacity(v.len());
-    for b in v.bytes() {
-        if b.is_ascii_alphanumeric() || b"-_.~!*'()".contains(&b) {
-            out.push(b as char);
-        } else {
-            out.push_str(&format!("%{b:02X}"));
-        }
-    }
-    out
+    encode_bytes(v.as_bytes())
 }
 
 /// The scheme and host (and port) of `u`, lower case: `"https://api.cexy.io"`.

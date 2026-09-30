@@ -16,6 +16,7 @@ use tokio_tungstenite::tungstenite::http::HeaderValue;
 use url::Url;
 
 use crate::amount::Amount;
+use crate::auth::Authenticator;
 use crate::client::{Client, check_secure_url};
 use crate::error::{Error, Result, WsError};
 use crate::live_balances::LiveBalances;
@@ -70,6 +71,10 @@ pub struct Welcome {
     /// Connection id, for support requests.
     #[serde(default)]
     pub connection_id: String,
+    /// The single-use challenge that [`WebSocket::auth_key`] signs (planned; absent until the
+    /// server supports API-key authentication).
+    #[serde(default)]
+    pub challenge: Option<String>,
 }
 
 /// A channel event such as `ticker.update`, `orderbook.update` or `order.filled`. Decode `data`
@@ -162,6 +167,8 @@ pub struct AuthResult {
     pub user_id: Option<String>,
     /// True when not connected: the token is kept and sent (and acknowledged) on connect.
     pub queued: bool,
+    /// How the connection is authenticated (`"api_key"` or `"session"`), when the server says.
+    pub auth: Option<String>,
 }
 
 /// Why state may have been missed.
@@ -261,6 +268,12 @@ pub enum AuthChangeReason {
     TokenExpired,
     /// A server sign-out with a reason this SDK does not know (raw value in `code`).
     SignedOut,
+    /// The API key was revoked or deleted (planned key authentication, `signed_out` reason
+    /// `key_revoked`). Automatic key re-authentication stops.
+    KeyRevoked,
+    /// The API key expired (planned key authentication, `signed_out` reason `key_expired`).
+    /// Automatic key re-authentication stops.
+    KeyExpired,
 }
 
 /// Carried by [`WsEvent::AuthChanged`].
@@ -456,6 +469,10 @@ pub(crate) struct State {
     welcome: Option<Welcome>,
     channels: Vec<String>,
     pub(crate) token: Option<String>,
+    /// The latest unused `auth_key` challenge (from the welcome or the last `auth_key` reply).
+    challenge: Option<String>,
+    /// `auth_key` is the active credential: re-signed after each reconnect.
+    key_auth: bool,
     /// The user of the last successful auth on the current connection.
     pub(crate) auth_user_id: Option<String>,
     /// Private channels dropped by a server sign-out, re-subscribed after the next successful auth.
@@ -497,9 +514,9 @@ pub(crate) struct Inner {
 
 /// The CEXY.io WebSocket client. Cloning is cheap; clones share the connection.
 ///
-/// API-key authentication on the WebSocket is not available yet: [`WebSocket::auth`] takes a
-/// session access token. Programs holding only an API key get public channels and poll REST for
-/// private state.
+/// [`WebSocket::auth`] takes a session access token. API-key authentication
+/// ([`WebSocket::auth_key`]) is planned: the server does not accept it yet, so programs holding
+/// only an API key get public channels and poll REST for private state.
 #[derive(Clone)]
 pub struct WebSocket {
     pub(crate) inner: Arc<Inner>,
@@ -685,15 +702,44 @@ impl WebSocket {
         let connected = {
             let mut s = self.inner.st.lock().unwrap();
             s.token = Some(token.to_string());
+            s.key_auth = false;
             s.out.is_some() && s.welcome.is_some()
         };
         if !connected {
             return Ok(AuthResult {
-                user_id: None,
                 queued: true,
+                ..Default::default()
             });
         }
         Inner::auth(&self.inner, token).await
+    }
+
+    /// Authenticates with the client's API key (PLANNED: the server does not accept it yet). It
+    /// signs the server's single-use challenge; the secret never leaves the process. After a
+    /// reconnect it signs the new connection's challenge automatically. A refused `auth_key`
+    /// stops the automatic re-authentication (the server closes the socket after 5 failures).
+    /// It needs a WebSocket from [`Client::websocket`] on a client with [`AuthScheme::Hmac`].
+    ///
+    /// [`AuthScheme::Hmac`]: crate::AuthScheme::Hmac
+    pub async fn auth_key(&self) -> Result<AuthResult> {
+        if self.inner.key_signer().is_none() {
+            return Err(Error::config(
+                "auth_key needs a WebSocket from Client::websocket on a client with AuthScheme::Hmac",
+            ));
+        }
+        let connected = {
+            let mut s = self.inner.st.lock().unwrap();
+            s.token = None;
+            s.key_auth = true;
+            s.out.is_some() && s.welcome.is_some()
+        };
+        if !connected {
+            return Ok(AuthResult {
+                queued: true,
+                ..Default::default()
+            });
+        }
+        Inner::auth_key(&self.inner).await
     }
 
     /// Sends a ping with an id and returns the round-trip time.
@@ -902,6 +948,7 @@ impl Inner {
                             heartbeat_interval_seconds: 0,
                             max_subscriptions: 0,
                             connection_id: String::new(),
+                            challenge: None,
                         });
                     return Ok((stream, welcome, early));
                 }
@@ -951,7 +998,7 @@ impl Inner {
     }
 
     fn on_welcome(this: &Arc<Inner>, welcome: Welcome) {
-        let (is_reconnect, token, channels, books, warn) = {
+        let (is_reconnect, (token, key_auth), channels, books, warn) = {
             let mut s = this.st.lock().unwrap();
             let warn = welcome.protocol_version != SUPPORTED_PROTOCOL_VERSION && !s.warned_version;
             if warn {
@@ -961,9 +1008,10 @@ impl Inner {
             s.ever_connected = true;
             s.auth_user_id = None; // a new connection starts signed out
             Inner::reset_seq(&mut s, None); // sequences on a new connection are unrelated
+            s.challenge = welcome.challenge.clone();
             (
                 r,
-                s.token.clone(),
+                (s.token.clone(), s.key_auth),
                 s.channels.clone(),
                 s.books.values().cloned().collect::<Vec<_>>(),
                 warn,
@@ -976,12 +1024,15 @@ impl Inner {
             )));
         }
         this.emit(WsEvent::Welcome(welcome.clone()));
-        if token.is_some() || !channels.is_empty() {
+        if token.is_some() || key_auth || !channels.is_empty() {
             let inner = this.clone();
             tokio::spawn(async move {
-                if let Some(t) = token
-                    && let Err(e) = Inner::auth(&inner, &t).await
-                {
+                let restored = match token {
+                    Some(t) => Some(Inner::auth(&inner, &t).await),
+                    None if key_auth => Some(Inner::auth_key(&inner).await),
+                    None => None,
+                };
+                if let Some(Err(e)) = restored {
                     inner.emit_error(e);
                 }
                 if !channels.is_empty()
@@ -1004,13 +1055,7 @@ impl Inner {
         let mut payload = Map::new();
         payload.insert("token".into(), Value::String(token.to_string()));
         match Inner::request(this, "auth", payload, vec![], true).await {
-            Ok(ack) => Ok(AuthResult {
-                user_id: ack
-                    .get("user_id")
-                    .and_then(Value::as_str)
-                    .map(str::to_string),
-                queued: false,
-            }),
+            Ok(ack) => Ok(auth_result(&ack)),
             Err(e) => {
                 if let Error::WebSocket(w) = &e
                     && w.from_server
@@ -1023,6 +1068,41 @@ impl Inner {
                 Err(e)
             }
         }
+    }
+
+    /// The client's credentials, when they can sign a WebSocket challenge.
+    fn key_signer(&self) -> Option<Arc<dyn Authenticator>> {
+        let auth = self.snapshots.as_ref()?.t.auth.clone()?;
+        auth.sign_websocket_challenge("", "")
+            .is_some()
+            .then_some(auth)
+    }
+
+    async fn auth_key(this: &Arc<Inner>) -> Result<AuthResult> {
+        let (challenge, connection_id) = {
+            let mut s = this.st.lock().unwrap();
+            // A challenge is signed at most once.
+            let c = s.challenge.take();
+            (c, s.welcome.as_ref().map(|w| w.connection_id.clone()))
+        };
+        let (Some(challenge), Some(connection_id)) = (challenge, connection_id) else {
+            return Err(WsError::local(
+                "NO_CHALLENGE",
+                "auth_key: the server has not issued a challenge on this connection",
+            )
+            .into());
+        };
+        let Some((key_id, signature)) = this
+            .key_signer()
+            .and_then(|a| a.sign_websocket_challenge(&connection_id, &challenge))
+        else {
+            return Err(Error::config("auth_key: the client cannot sign"));
+        };
+        let mut payload = Map::new();
+        payload.insert("key_id".into(), Value::String(key_id));
+        payload.insert("signature".into(), Value::String(signature));
+        let ack = Inner::request(this, "auth_key", payload, vec![], true).await?;
+        Ok(auth_result(&ack))
     }
 
     async fn send_subscribe(this: &Arc<Inner>, channels: Vec<String>) -> Result<Vec<String>> {
@@ -1090,7 +1170,7 @@ impl Inner {
                 this.st.lock().unwrap().pending.remove(&id);
                 if strict {
                     let ack = match kind {
-                        "auth" => "authenticated",
+                        "auth" | "auth_key" => "authenticated",
                         "subscribe" => "subscribed",
                         "unsubscribe" => "unsubscribed",
                         _ => "pong",
@@ -1191,6 +1271,8 @@ impl Inner {
                 this.emit(WsEvent::Pong { id });
             }
             "authenticated" => {
+                // Every auth_key reply carries the next challenge: store it before anything else.
+                this.store_challenge(&frame);
                 let user_id = frame
                     .get("user_id")
                     .and_then(Value::as_str)
@@ -1201,7 +1283,12 @@ impl Inner {
                 // Update the state before `auth` returns, and before any later frame.
                 Inner::on_authenticated(this, user_id);
                 if let Some(id) = &id {
-                    this.settle(id, Some("auth"), Ok(value));
+                    let kind = this
+                        .pending_kind(id)
+                        .filter(|k| *k == "auth" || *k == "auth_key");
+                    if kind.is_some() {
+                        this.settle(id, kind, Ok(value));
+                    }
                 }
             }
             "subscribed" | "unsubscribed" => {
@@ -1258,6 +1345,15 @@ impl Inner {
                         }));
                     }
                     "expired" => this.signed_out(AuthChangeReason::TokenExpired, None),
+                    "key_revoked" | "key_expired" => {
+                        this.st.lock().unwrap().key_auth = false; // the key cannot sign in again
+                        let reason = if raw == "key_revoked" {
+                            AuthChangeReason::KeyRevoked
+                        } else {
+                            AuthChangeReason::KeyExpired
+                        };
+                        this.signed_out(reason, None);
+                    }
                     _ => this.signed_out(AuthChangeReason::SignedOut, Some(raw)),
                 }
             }
@@ -1277,17 +1373,17 @@ impl Inner {
                     message: message.to_string(),
                     from_server: true,
                 };
+                // An error reply to auth_key carries the next challenge too.
+                this.store_challenge(&frame);
                 if let Some(id) = &id {
                     // Any error on an auth frame signs the connection out (an UNAUTHENTICATED
                     // error on a subscribe is only a refused subscribe).
-                    let is_auth = this
-                        .st
-                        .lock()
-                        .unwrap()
-                        .pending
-                        .get(id)
-                        .is_some_and(|p| p.kind == "auth");
-                    if is_auth {
+                    let kind = this.pending_kind(id);
+                    if kind == Some("auth_key") {
+                        // A refused key is not tried again automatically.
+                        this.st.lock().unwrap().key_auth = false;
+                    }
+                    if matches!(kind, Some("auth" | "auth_key")) {
                         this.signed_out(AuthChangeReason::AuthFailed, Some(code.to_string()));
                     }
                     this.settle(id, None, Err(err.clone()));
@@ -1371,6 +1467,16 @@ impl Inner {
                 this.emit(WsEvent::Event(ev));
             }
             _ => {} // unknown frame types are ignored
+        }
+    }
+
+    fn pending_kind(&self, id: &str) -> Option<&'static str> {
+        self.st.lock().unwrap().pending.get(id).map(|p| p.kind)
+    }
+
+    fn store_challenge(&self, frame: &Map<String, Value>) {
+        if let Some(c) = frame.get("challenge").and_then(Value::as_str) {
+            self.st.lock().unwrap().challenge = Some(c.to_string());
         }
     }
 
@@ -1753,6 +1859,9 @@ async fn run_connection(
                     }
                     Some(Ok(m)) => {
                         let Some(i) = inner.upgrade() else { return };
+                        if i.st.lock().unwrap().conn_gen != generation {
+                            return; // a superseded connection: its late frames change nothing
+                        }
                         if let Some(frame) = parse_frame(&m) {
                             Inner::on_frame(&i, frame);
                         }
@@ -1797,4 +1906,13 @@ fn uniq(it: impl IntoIterator<Item = String>) -> Vec<String> {
         }
     }
     out
+}
+
+fn auth_result(ack: &Map<String, Value>) -> AuthResult {
+    let text = |k: &str| ack.get(k).and_then(Value::as_str).map(str::to_string);
+    AuthResult {
+        user_id: text("user_id"),
+        queued: false,
+        auth: text("auth"),
+    }
 }

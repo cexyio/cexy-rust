@@ -33,6 +33,7 @@ mod operations_gen;
 mod orderbook;
 mod pagination;
 mod services;
+mod signing;
 mod tls;
 mod transport;
 mod ws;
@@ -41,7 +42,7 @@ pub use amount::{Amount, BookLevel, levels};
 pub use auth::{ApiKeyAuthenticator, AuthRequest, Authenticator};
 pub use cancel_all::{CancelAllOptions, CancelAllStop, CancelAllSummary, CancelAllTarget};
 pub use client::{
-    CallOptions, Client, ClientOptions, DEFAULT_BASE_URL, DEFAULT_RPM_ANONYMOUS,
+    AuthScheme, CallOptions, Client, ClientOptions, DEFAULT_BASE_URL, DEFAULT_RPM_ANONYMOUS,
     DEFAULT_RPM_WITH_KEY, OnRetry, is_local_host,
 };
 pub use error::{
@@ -58,6 +59,7 @@ pub use pagination::{ItemStream, Page};
 pub use services::{
     Account, Assets, Exports, Fees, Markets, Networks, PlaceOrderResult, Pools, Trading, Wallet,
 };
+pub use signing::{HmacAuthenticator, MAX_CLOCK_OFFSET, SIGNING_SCHEME};
 pub use transport::RetryInfo;
 pub use ws::{
     AuthChange, AuthChangeReason, AuthResult, BookEvent, CloseInfo, DEFAULT_WEBSOCKET_URL,

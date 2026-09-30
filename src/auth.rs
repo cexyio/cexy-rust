@@ -37,10 +37,28 @@ pub trait Authenticator: Send + Sync + 'static {
     fn authenticate(&self, request: &mut AuthRequest<'_>) -> Result<()>;
     /// Removes any secret material from text (used on error messages).
     fn redact(&self, text: &str) -> String;
+
+    /// For request-signing schemes: adopt the server clock after `SIGNATURE_EXPIRED`
+    /// (`details.server_time_ms`). `Some(true)`: the request is signed again and resent once;
+    /// `Some(false)`: the local clock is too far off (a clock error is returned). `None` (the
+    /// default): this scheme does not sign, and the error is returned as is.
+    fn adjust_clock(&self, _server_time_ms: i64) -> Option<bool> {
+        None
+    }
+
+    /// Signs a WebSocket `auth_key` challenge: `(key_id, signature)`. `None` (the default): this
+    /// scheme cannot authenticate a WebSocket.
+    fn sign_websocket_challenge(
+        &self,
+        _connection_id: &str,
+        _challenge: &str,
+    ) -> Option<(String, String)> {
+        None
+    }
 }
 
 /// Today's scheme: `X-API-Key` and `X-API-Secret` headers on every private request. HMAC request
-/// signing is planned before 1.0 and will be another [`Authenticator`].
+/// signing ([`crate::HmacAuthenticator`], planned) is the other scheme.
 ///
 /// Its `Debug` and `Display` never reveal the secret.
 #[derive(Clone)]
