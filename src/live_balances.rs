@@ -467,6 +467,7 @@ impl LiveBalances {
                         });
                         st.rows.clear();
                         st.tombstones.clear();
+                        st.buffer.clear(); // events that arrived during the owner lookup
                         st.fetching = false;
                         st.again = None;
                         drop(st);
