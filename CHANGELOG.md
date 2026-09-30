@@ -6,6 +6,33 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-dev.5] (2026-09-30)
+
+### Fixed
+- WebSocket: private channels no longer go silent after a server-side sign-out. The server ends
+  every private subscription (without a frame) when `auth` succeeds as another user, when an
+  `auth` fails, or when this connection's own session is revoked. The client kept those channels
+  as held (after a failed auth) or never noticed the switch, so `subscribe` for them sent
+  nothing. It now drops them, emits the new `WsEvent::AuthChanged` (`AuthChange`: `reason`,
+  `previous_user_id`, `user_id`, `code`, `dropped`) and re-subscribes them: at once after a switch
+  to another user, after the next successful `auth` otherwise, followed by
+  `WsEvent::Resync(ResyncReason::Reauth)`. Re-authenticating as the same user changes nothing.
+- WebSocket: a `subscribe` refused by the server (e.g. `UNAUTHENTICATED` for a private channel)
+  no longer leaves the channels in `channels()`.
+
+### Changed
+- WebSocket: `session.revoked` acts only when `data.current` is exactly `true` (this connection's
+  own session). Another session's revocation (`current: false`) no longer emits
+  `WsEvent::AuthLost`, drops private channels or forgets the token. **Behaviour change.**
+- `ResyncReason` is now `#[non_exhaustive]` and gains `Reauth`: a `match` on it needs a wildcard
+  arm. **Breaking for exhaustive matches** (pre-1.0).
+
+### Added
+- `WebSocket::has_token`, `WsEvent::AuthChanged`, `AuthChange` and `AuthChangeReason`
+  (`#[non_exhaustive]`).
+- Conformance: runs `cexy-api-spec/conformance/ws/private_signout.json` against a local scripted
+  server, each case in its own task so every failing case is reported.
+
 ## [0.1.0-dev.4] (2026-09-29)
 
 ### Added

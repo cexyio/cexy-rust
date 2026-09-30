@@ -162,11 +162,44 @@ pub struct AuthResult {
 
 /// Why state may have been missed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ResyncReason {
     /// The server dropped messages (`CONCURRENT_MODIFICATION` without a request id).
     ConcurrentModification,
     /// The connection was re-established.
     Reconnect,
+    /// Private channels were re-subscribed after the server signed the connection out or
+    /// switched it to another account: refetch private state through REST.
+    Reauth,
+}
+
+/// Why the server ended the connection's private subscriptions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum AuthChangeReason {
+    /// `auth` succeeded as a different user.
+    UserChanged,
+    /// An `auth` failed; the server signs the connection out on any auth error.
+    AuthFailed,
+    /// This connection's own session was revoked (`session.revoked` with `current: true`).
+    SessionRevoked,
+}
+
+/// Carried by [`WsEvent::AuthChanged`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthChange {
+    /// Why.
+    pub reason: AuthChangeReason,
+    /// The user of the last successful auth on this connection, if any.
+    pub previous_user_id: Option<String>,
+    /// The new user ([`AuthChangeReason::UserChanged`]), otherwise `None`: signed out.
+    pub user_id: Option<String>,
+    /// The server's error code ([`AuthChangeReason::AuthFailed`] only).
+    pub code: Option<String>,
+    /// Private channels the server dropped. They are re-subscribed automatically: at once for
+    /// `UserChanged`, after the next successful `auth` otherwise (then
+    /// [`ResyncReason::Reauth`]).
+    pub dropped: Vec<String>,
 }
 
 /// A live order book changed state.
@@ -244,9 +277,13 @@ pub enum WsEvent {
     Reconnected(Welcome),
     /// State may have been missed: refetch anything you keep from private or public channels.
     Resync(ResyncReason),
-    /// `session.revoked` arrived: private channels are dead. The socket stays open and public
-    /// channels keep working. Call `auth` with a new token to restore private channels.
+    /// `session.revoked` arrived for this connection's own session (`current: true`): private
+    /// channels are dead. The socket stays open and public channels keep working. Call `auth`
+    /// with a new token to restore private channels.
     AuthLost(WsFrame),
+    /// The server ended this connection's private subscriptions: `auth` succeeded as another
+    /// user, an `auth` failed, or this connection's own session was revoked.
+    AuthChanged(AuthChange),
     /// A live order book changed state.
     Book(BookEvent),
 }
@@ -326,6 +363,10 @@ pub(crate) struct State {
     welcome: Option<Welcome>,
     channels: Vec<String>,
     pub(crate) token: Option<String>,
+    /// The user of the last successful auth on the current connection.
+    auth_user_id: Option<String>,
+    /// Private channels dropped by a server sign-out, re-subscribed after the next successful auth.
+    pending_private: Vec<String>,
     pending: HashMap<String, Pending>,
     next_id: u64,
     closed_by_user: bool,
@@ -494,6 +535,12 @@ impl WebSocket {
         self.inner.st.lock().unwrap().channels.clone()
     }
 
+    /// Whether a session token is kept for automatic re-authentication. A refused token and a
+    /// revoked session are forgotten.
+    pub fn has_token(&self) -> bool {
+        self.inner.st.lock().unwrap().token.is_some()
+    }
+
     /// Opens the connection and returns the server's welcome frame. After it succeeds, dropped
     /// connections are reopened automatically until [`WebSocket::close`] (unless `reconnect` is
     /// false).
@@ -558,7 +605,8 @@ impl WebSocket {
             let mut s = self.inner.st.lock().unwrap();
             let mut fresh = vec![];
             for c in wanted {
-                if s.channels.contains(&c) {
+                // Private channels waiting for the next successful auth count as held.
+                if s.channels.contains(&c) || s.pending_private.contains(&c) {
                     res.already_subscribed.push(c);
                 } else {
                     fresh.push(c);
@@ -568,7 +616,7 @@ impl WebSocket {
                 .inner
                 .opts
                 .max_subscriptions
-                .saturating_sub(s.channels.len());
+                .saturating_sub(s.channels.len() + s.pending_private.len());
             let accepted: Vec<String> = fresh.iter().take(room).cloned().collect();
             res.refused = fresh[accepted.len()..].to_vec();
             s.channels.extend(accepted.iter().cloned());
@@ -583,7 +631,23 @@ impl WebSocket {
         if accepted.is_empty() || !connected {
             return Ok(res);
         }
-        res.added = Inner::send_subscribe(&self.inner, accepted).await?;
+        match Inner::send_subscribe(&self.inner, accepted.clone()).await {
+            Ok(added) => res.added = added,
+            Err(e) => {
+                if let Error::WebSocket(w) = &e
+                    && w.from_server
+                {
+                    // Refused by the server (e.g. UNAUTHENTICATED for a private channel): not held.
+                    self.inner
+                        .st
+                        .lock()
+                        .unwrap()
+                        .channels
+                        .retain(|c| !accepted.contains(c));
+                }
+                return Err(e);
+            }
+        }
         Ok(res)
     }
 
@@ -781,6 +845,7 @@ impl Inner {
             }
             let r = s.ever_connected;
             s.ever_connected = true;
+            s.auth_user_id = None; // a new connection starts signed out
             (
                 r,
                 s.token.clone(),
@@ -858,6 +923,7 @@ impl Inner {
             let mut s = this.st.lock().unwrap();
             let mut held = vec![];
             for c in uniq(channels) {
+                s.pending_private.retain(|x| x != &c);
                 if let Some(i) = s.channels.iter().position(|x| x == &c) {
                     s.channels.remove(i);
                     held.push(c);
@@ -1009,14 +1075,18 @@ impl Inner {
                 this.emit(WsEvent::Pong { id });
             }
             "authenticated" => {
-                if let Some(id) = &id {
-                    this.settle(id, Some("auth"), Ok(value));
-                }
                 let user_id = frame
                     .get("user_id")
                     .and_then(Value::as_str)
                     .map(str::to_string);
-                this.emit(WsEvent::Authenticated { user_id });
+                this.emit(WsEvent::Authenticated {
+                    user_id: user_id.clone(),
+                });
+                // Update the state before `auth` returns, and before any later frame.
+                Inner::on_authenticated(this, user_id);
+                if let Some(id) = &id {
+                    this.settle(id, Some("auth"), Ok(value));
+                }
             }
             "subscribed" | "unsubscribed" => {
                 let channels = string_list(frame.get("channels"));
@@ -1052,6 +1122,18 @@ impl Inner {
                     from_server: true,
                 };
                 if let Some(id) = &id {
+                    // Any error on an auth frame signs the connection out (an UNAUTHENTICATED
+                    // error on a subscribe is only a refused subscribe).
+                    let is_auth = this
+                        .st
+                        .lock()
+                        .unwrap()
+                        .pending
+                        .get(id)
+                        .is_some_and(|p| p.kind == "auth");
+                    if is_auth {
+                        this.signed_out(AuthChangeReason::AuthFailed, Some(code.to_string()));
+                    }
                     this.settle(id, None, Err(err.clone()));
                 }
                 this.emit(WsEvent::ServerError(err));
@@ -1068,13 +1150,18 @@ impl Inner {
                 let Ok(ev) = serde_json::from_value::<WsFrame>(value) else {
                     return;
                 };
-                if ev.r#type == "session.revoked" {
-                    {
-                        let mut s = this.st.lock().unwrap();
-                        s.token = None;
-                        s.channels
-                            .retain(|c| !PRIVATE_CHANNELS.contains(&c.as_str()));
-                    }
+                // Only this connection's own session signs it out (the server checks
+                // current == true exactly); current false, missing or not a boolean changes
+                // nothing.
+                if ev.r#type == "session.revoked"
+                    && frame
+                        .get("data")
+                        .and_then(|d| d.get("current"))
+                        .and_then(Value::as_bool)
+                        == Some(true)
+                {
+                    this.st.lock().unwrap().token = None; // never re-auth with a revoked session
+                    this.signed_out(AuthChangeReason::SessionRevoked, None);
                     this.emit(WsEvent::AuthLost(ev.clone()));
                 }
                 if ev.r#type == "orderbook.update" {
@@ -1094,6 +1181,88 @@ impl Inner {
             }
             _ => {} // unknown frame types are ignored
         }
+    }
+
+    /// Moves the held private channels to the pending set and returns them.
+    fn drop_private(s: &mut State) -> Vec<String> {
+        let dropped: Vec<String> = s
+            .channels
+            .iter()
+            .filter(|c| PRIVATE_CHANNELS.contains(&c.as_str()))
+            .cloned()
+            .collect();
+        s.channels.retain(|c| !dropped.contains(c));
+        for c in &dropped {
+            if !s.pending_private.contains(c) {
+                s.pending_private.push(c.clone());
+            }
+        }
+        dropped
+    }
+
+    /// The server signed the connection out and ended every private subscription.
+    fn signed_out(&self, reason: AuthChangeReason, code: Option<String>) {
+        let change = {
+            let mut s = self.st.lock().unwrap();
+            AuthChange {
+                reason,
+                previous_user_id: s.auth_user_id.take(),
+                user_id: None,
+                code,
+                dropped: Inner::drop_private(&mut s),
+            }
+        };
+        self.emit(WsEvent::AuthChanged(change));
+    }
+
+    /// A successful auth: detects an account switch, then restores the pending private channels.
+    fn on_authenticated(this: &Arc<Inner>, user_id: Option<String>) {
+        let (change, channels) = {
+            let mut s = this.st.lock().unwrap();
+            let previous = std::mem::replace(&mut s.auth_user_id, user_id.clone());
+            let change = match previous {
+                Some(prev) if user_id.as_ref() != Some(&prev) => Some(AuthChange {
+                    reason: AuthChangeReason::UserChanged,
+                    previous_user_id: Some(prev),
+                    user_id,
+                    code: None,
+                    dropped: Inner::drop_private(&mut s),
+                }),
+                _ => None,
+            };
+            let channels = std::mem::take(&mut s.pending_private);
+            s.channels.extend(channels.iter().cloned());
+            (change, channels)
+        };
+        if let Some(c) = change {
+            this.emit(WsEvent::AuthChanged(c));
+        }
+        if channels.is_empty() {
+            return;
+        }
+        // Not on the read task: the acknowledgement arrives through it.
+        let inner = this.clone();
+        let sent = channels.clone();
+        tokio::spawn(async move {
+            if let Err(e) = Inner::send_subscribe(&inner, sent.clone()).await {
+                if let Error::WebSocket(w) = &e
+                    && w.from_server
+                {
+                    // Refused by the server (e.g. signed out again meanwhile): back to pending.
+                    let mut s = inner.st.lock().unwrap();
+                    for c in &sent {
+                        if let Some(i) = s.channels.iter().position(|x| x == c) {
+                            s.channels.remove(i);
+                            if !s.pending_private.contains(c) {
+                                s.pending_private.push(c.clone());
+                            }
+                        }
+                    }
+                }
+                inner.emit_error(e);
+            }
+        });
+        this.emit(WsEvent::Resync(ResyncReason::Reauth));
     }
 
     fn on_dropped(this: &Arc<Inner>, generation: u64, code: u16, reason: String) {
@@ -1186,6 +1355,7 @@ impl Inner {
                 return;
             }
             s.closed_by_user = true;
+            s.auth_user_id = None;
             let was_open = s.out.is_some();
             Inner::teardown(
                 &mut s,
