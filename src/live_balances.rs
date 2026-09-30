@@ -28,7 +28,7 @@ pub struct LiveBalancesOptions {
     /// WebSocket is authenticated as.
     pub snapshot: Option<BalanceSnapshotFn>,
     /// The user id the snapshot source belongs to, compared with the WebSocket's authenticated
-    /// user before every merge. Default: the Client's `account().id()` (GET /api/v1/account/id).
+    /// user at the start and after every account change. Default: the Client's `account().id()` (GET /api/v1/account/id).
     pub owner_id: Option<OwnerIdFn>,
     /// A fixed owner user id instead of `owner_id`.
     pub account_id: Option<String>,
@@ -133,11 +133,18 @@ struct LbInner {
 /// An event applies only if its `data.sequence` is greater than the stored one for that asset; a
 /// total of 0 removes the row (a snapshot row at or below that sequence cannot bring it back). A
 /// new snapshot is taken on a frame gap, `balances.resync`, `CONCURRENT_MODIFICATION`, a reconnect
-/// and after an account change, never because `data.sequence` skipped values. Before every merge
+/// and after an account change, never because `data.sequence` skipped values. At the start and after every account change
 /// the snapshot source's owner is checked against the WebSocket user.
 #[derive(Clone)]
 pub struct LiveBalances {
     inner: Arc<LbInner>,
+}
+
+#[cfg(test)]
+impl LiveBalances {
+    pub(crate) fn buffered_events(&self) -> usize {
+        self.inner.st.lock().unwrap().buffer.len()
+    }
 }
 
 impl std::fmt::Debug for LiveBalances {
@@ -159,10 +166,11 @@ fn rust_decimal_like_zero(s: &str) -> bool {
 impl WebSocket {
     /// Live balances of the authenticated account (call `auth` first): subscribes `balances`,
     /// takes a REST snapshot, applies newer `balance.updated` events and refetches by itself when
-    /// events may be missing. Before every merge the snapshot source's owner must equal the
+    /// events may be missing. At the start and after every account change the snapshot source's owner must equal the
     /// WebSocket's authenticated user; otherwise nothing is merged
     /// ([`BalancesEvent::AccountMismatch`]).
     pub async fn live_balances(&self, options: LiveBalancesOptions) -> Result<LiveBalances> {
+        let custom_snapshot = options.snapshot.is_some();
         let snapshot = match options.snapshot {
             Some(f) => f,
             None => {
@@ -189,13 +197,15 @@ impl WebSocket {
                 let id = id.clone();
                 Box::pin(async move { Ok(id) })
             }),
-            (None, None, Some(client)) => {
+            // The REST key's account owns only the REST key's own snapshots: a custom snapshot
+            // source must name its owner.
+            (None, None, Some(client)) if !custom_snapshot => {
                 Arc::new(move || -> BoxFuture<'static, Result<String>> {
                     let c = client.clone();
                     Box::pin(async move { c.account().id().await })
                 })
             }
-            (None, None, None) => {
+            (None, None, _) => {
                 return Err(WsError::local(
                     "CONFIG",
                     "live_balances needs options.owner_id or options.account_id to check the snapshot's account",
@@ -356,8 +366,14 @@ impl LiveBalances {
                 ));
             }
         }
-        if st.fetching || st.verified_user.is_none() {
+        // Buffered only while a snapshot is in flight (it is applied on top). Without a verified
+        // owner and no fetch (mismatch, retry backoff, signed out), events are dropped: the next
+        // snapshot is complete anyway.
+        if st.fetching {
             st.buffer.push(d);
+            return;
+        }
+        if st.verified_user.is_none() {
             return;
         }
         if let Some(ev) = Self::apply(&mut st, d, true) {

@@ -1242,7 +1242,8 @@ impl Inner {
                 let raw = frame
                     .get("reason")
                     .and_then(Value::as_str)
-                    .unwrap_or("")
+                    .filter(|r| !r.is_empty())
+                    .unwrap_or("unknown")
                     .to_string();
                 this.st.lock().unwrap().token = None;
                 match raw.as_str() {
@@ -1665,6 +1666,9 @@ impl Inner {
         this.closing.notify_waiters();
         for b in books {
             b.mark_disconnected();
+        }
+        for lb in this.helpers() {
+            lb.mark_stale(); // no connection: nothing is live any more
         }
         if was_open {
             this.emit(WsEvent::Close(CloseInfo {

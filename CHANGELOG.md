@@ -16,7 +16,8 @@ All notable changes to this project are documented here. The format follows
   happens on a missed event, `balances.resync`, `CONCURRENT_MODIFICATION`, a reconnect or an account
   change, at most every `min_snapshot_interval` (default 2 s), with retry backoff. Before every
   merge the REST key's account (`Account::id`) must be the WebSocket's user, otherwise nothing is
-  merged (`BalancesEvent::AccountMismatch`). Events without `sequence` (older servers) always apply
+  merged (`BalancesEvent::AccountMismatch`). A custom `snapshot` must name its owner (`owner_id` or `account_id`),
+  otherwise `live_balances` fails with a `CONFIG` error. Events without `sequence` (older servers) always apply
   and emit one `WsEvent::Warning`. `is_stale`, `last_error`, `get`, `all`, `close`; events through
   `WsEvent::Balances` (`Updated`, `Snapshot`, `AccountMismatch`, `Error`).
 - WebSocket: frame-sequence tracking on private channels. A gap that is not filled within
@@ -27,7 +28,7 @@ All notable changes to this project are documented here. The format follows
 - WebSocket: the planned `signed_out` server frame is handled as a server sign-out:
   `AuthChangeReason::TokenExpired`, `SessionRevoked` plus `WsEvent::AuthLost` (synthetic
   `session.revoked` frame with `data.reason` `"signed_out"`), or `SignedOut` with the raw reason in
-  `code`. The token is forgotten.
+  `code` (`"unknown"` when the frame has none). The token is forgotten.
 - `Balance::sequence` (a missing value decodes as 0), `WebSocket::user_id`, `WsClock` / `WsTimer` /
   `WsOptions::clock` (test-only time source).
 

@@ -56,7 +56,7 @@ pub(super) fn tracked(ev: WsEvent) -> Option<Value> {
             ResyncReason::BalancesResync => "balances_resync",
             ResyncReason::DepositsResync => "deposits_resync",
             ResyncReason::WithdrawalsResync => "withdrawals_resync",
-            _ => "concurrent_modification",
+            ResyncReason::ConcurrentModification => "concurrent_modification",
         }})),
         WsEvent::AuthLost(_) => Some(json!({"type": "auth_lost"})),
         _ => None,

@@ -450,3 +450,153 @@ async fn default_owner_mismatch_never_merges() {
     lb.close();
     ws.close().await;
 }
+
+async fn authed_ws(
+    srv: &mut Server,
+    client: Option<&crate::Client>,
+) -> (WebSocket, WsEvents, Conn) {
+    let ws = match client {
+        Some(c) => c.websocket(options(&srv.url)).unwrap(),
+        None => WebSocket::new(options(&srv.url)).unwrap(),
+    };
+    let rx = ws.events().unwrap();
+    ws.connect().await.unwrap();
+    let mut c = srv.conn().await;
+    let ws2 = ws.clone();
+    let a = tokio::spawn(async move { ws2.auth("tok").await });
+    let req = c.recv().await;
+    c.send(json!({"type": "authenticated", "user_id": "u1", "id": req["id"]}));
+    a.await.unwrap().unwrap();
+    (ws, rx, c)
+}
+
+#[tokio::test]
+async fn custom_snapshot_needs_an_owner() {
+    let rest = wiremock::MockServer::start().await;
+    let (client, _) = super::helpers::client(&rest);
+    let mut srv = Server::start().await;
+    let (ws, _rx, _c) = authed_ws(&mut srv, Some(&client)).await;
+    let snap: crate::BalanceSnapshotFn =
+        Arc::new(|| -> BoxFuture<'static, crate::Result<Vec<Balance>>> {
+            Box::pin(async { Ok(vec![]) })
+        });
+    let err = ws
+        .live_balances(LiveBalancesOptions {
+            snapshot: Some(snap),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, crate::Error::WebSocket(w) if w.code == "CONFIG"),
+        "{err}"
+    );
+    assert!(rest.received_requests().await.unwrap().is_empty());
+    ws.close().await;
+}
+
+#[tokio::test]
+async fn no_buffering_while_unverified_and_close_marks_stale() {
+    let mut srv = Server::start().await;
+    let (ws, _rx, mut c) = authed_ws(&mut srv, None).await;
+    let owner = Arc::new(Mutex::new("someone_else".to_string()));
+    let o = owner.clone();
+    let owner_fn: crate::OwnerIdFn =
+        Arc::new(move || -> BoxFuture<'static, crate::Result<String>> {
+            let v = o.lock().unwrap().clone();
+            Box::pin(async move { Ok(v) })
+        });
+    let snap: crate::BalanceSnapshotFn =
+        Arc::new(|| -> BoxFuture<'static, crate::Result<Vec<Balance>>> {
+            Box::pin(async {
+                Ok(vec![
+                    serde_json::from_value(
+                        json!({"asset": "USDT", "available": "5", "locked": "0",
+                "pending": "0", "total": "5", "held_incoming": [], "sequence": 10}),
+                    )
+                    .unwrap(),
+                ])
+            })
+        });
+    let ws2 = ws.clone();
+    let h = tokio::spawn(async move {
+        ws2.live_balances(LiveBalancesOptions {
+            snapshot: Some(snap),
+            owner_id: Some(owner_fn),
+            min_snapshot_interval: Some(Duration::ZERO),
+            ..Default::default()
+        })
+        .await
+    });
+    let req = c.recv().await;
+    c.send(json!({"type": "subscribed", "channels": ["balances"], "id": req["id"]}));
+    let lb = h.await.unwrap().unwrap();
+    for _ in 0..400 {
+        if lb.last_error().is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        lb.last_error().map(|e| e.code),
+        Some("ACCOUNT_MISMATCH".to_string())
+    );
+    for i in 0..500 {
+        c.send(json!({"type": "balance.updated", "channel": "balances",
+            "data": {"asset": "USDT", "available": "9", "locked": "0", "pending": "0", "total": "9", "sequence": 50 + i}}));
+    }
+    ws.ping().await.unwrap();
+    assert_eq!(lb.buffered_events(), 0);
+    *owner.lock().unwrap() = "u1".into();
+    c.send(json!({"type": "balances.resync", "channel": "balances", "data": {}}));
+    for _ in 0..400 {
+        if !lb.is_stale() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let row = lb.get("USDT").unwrap();
+    assert_eq!((row.total.as_str(), row.sequence), ("5", 10));
+    ws.close().await;
+    assert!(lb.is_stale());
+}
+
+#[tokio::test]
+async fn signed_out_auth_lost_payload_and_unknown_reason() {
+    let mut srv = Server::start().await;
+    let (ws, mut rx, mut c) = authed_ws(&mut srv, None).await;
+    c.send(json!({"type": "signed_out", "reason": "revoked"}));
+    ws.ping().await.unwrap();
+    let mut lost = vec![];
+    while let Ok(ev) = rx.try_recv() {
+        if let WsEvent::AuthLost(f) = ev {
+            lost.push(f);
+        }
+    }
+    assert_eq!(lost.len(), 1);
+    assert_eq!(
+        (lost[0].r#type.as_str(), lost[0].channel.as_str()),
+        ("session.revoked", "account")
+    );
+    assert_eq!(
+        lost[0].data,
+        json!({"session_id": null, "reason": "signed_out", "current": true})
+    );
+    let ws2 = ws.clone();
+    let a = tokio::spawn(async move { ws2.auth("tok2").await });
+    let req = c.recv().await;
+    c.send(json!({"type": "authenticated", "user_id": "u1", "id": req["id"]}));
+    a.await.unwrap().unwrap();
+    c.send(json!({"type": "signed_out"}));
+    ws.ping().await.unwrap();
+    let mut last = None;
+    while let Ok(ev) = rx.try_recv() {
+        if let WsEvent::AuthChanged(ch) = ev {
+            last = Some(ch);
+        }
+    }
+    let last = last.unwrap();
+    assert_eq!(last.reason, crate::AuthChangeReason::SignedOut);
+    assert_eq!(last.code.as_deref(), Some("unknown"));
+    ws.close().await;
+}

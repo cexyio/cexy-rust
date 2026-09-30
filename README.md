@@ -325,7 +325,7 @@ let _ = (lb.get("USDT"), lb.is_stale(), lb.last_error());
 events (only when their `sequence` is greater than the one it holds; a total of 0 removes the row).
 It refetches by itself on a missed event, `balances.resync`, `CONCURRENT_MODIFICATION`, a reconnect
 or an account change, at most every `min_snapshot_interval` (default 2 s; `Duration::ZERO`: none),
-and never because a balance's own sequence skipped values. Before every merge it checks that the
+and never because a balance's own sequence skipped values. At the start and after every account change it checks that the
 REST key's account (`account().id()`) is the WebSocket's authenticated user: otherwise nothing is
 merged (`BalancesEvent::AccountMismatch`, and `last_error()` has code `ACCOUNT_MISMATCH`).
 
