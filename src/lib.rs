@@ -27,6 +27,7 @@ mod client;
 mod clock;
 mod error;
 mod limiter;
+mod live_balances;
 mod models_gen;
 mod operations_gen;
 mod orderbook;
@@ -47,6 +48,9 @@ pub use error::{
     ApiError, ConnectionError, Error, ErrorCategory, MAX_SERVER_WAIT, Result, WsError,
 };
 pub use limiter::RateLimitState;
+pub use live_balances::{
+    BalanceSnapshotFn, BalancesEvent, LiveBalances, LiveBalancesOptions, OwnerIdFn,
+};
 pub use models_gen::*;
 pub use operations_gen::*;
 pub use orderbook::{BookSnapshot, LiveOrderBook, WS_BOOK_DEPTH};
@@ -57,8 +61,9 @@ pub use services::{
 pub use transport::RetryInfo;
 pub use ws::{
     AuthChange, AuthChangeReason, AuthResult, BookEvent, CloseInfo, DEFAULT_WEBSOCKET_URL,
-    OrderBookUpdate, PRIVATE_CHANNELS, ResyncReason, SUPPORTED_PROTOCOL_VERSION, SessionRevoked,
-    SubscribeResult, WebSocket, Welcome, WsEvent, WsEvents, WsFrame, WsOptions,
+    OrderBookUpdate, PRIVATE_CHANNELS, ResyncReason, SUPPORTED_PROTOCOL_VERSION, SequenceGap,
+    SessionRevoked, SubscribeResult, WebSocket, Welcome, WsClock, WsEvent, WsEvents, WsFrame,
+    WsOptions, WsTimer,
 };
 
 /// SDK version.

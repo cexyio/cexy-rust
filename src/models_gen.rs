@@ -11,6 +11,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::amount::Amount;
 
+/// The id of the account a credential belongs to, and nothing else.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AccountId {
+    /// Account id: the same hex as the realtime `authenticated` reply's `user_id`.
+    pub user_id: String,
+}
+
 /// An existing key. Never carries the secret.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ApiKey {
@@ -158,6 +165,9 @@ pub struct Balance {
     pub locked: Amount,
     /// `pending`
     pub pending: Amount,
+    /// This balance's sequence: it rises with every change to it, and `balance.updated` carries the same number as `data.sequence`. Apply an event only if its sequence is greater than the one this snapshot holds. 0 for a balance never touched.
+    #[serde(default)]
+    pub sequence: i64,
     /// `total`
     pub total: Amount,
 }

@@ -9,8 +9,8 @@ use super::helpers::*;
 use crate::{CallOptions, Client, ClientOptions, Error, ErrorCategory, OperationId};
 
 #[test]
-fn surface_has_41_operations() {
-    assert_eq!(OperationId::ALL.len(), 41);
+fn surface_has_42_operations() {
+    assert_eq!(OperationId::ALL.len(), 42);
     let place = OperationId::PlaceOrder.info();
     assert_eq!(
         (place.method, place.path, place.auth, place.scope),
@@ -367,4 +367,18 @@ async fn sub_account_balances_empty_id_is_rejected_before_any_request() {
     let e = c.account().sub_account_balances("").await.unwrap_err();
     assert!(matches!(e, Error::Config(_)), "{e}");
     assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn account_id_path_and_auth() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/account/id"))
+        .and(header("x-api-key", KEY))
+        .respond_with(data(json!({"user_id": "aaaa0001"})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let (c, _) = client_with(&server, true, |_| {});
+    assert_eq!(c.account().id().await.unwrap(), "aaaa0001");
 }

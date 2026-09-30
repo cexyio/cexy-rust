@@ -15,12 +15,12 @@ The official Rust SDK for the [CEXY.io](https://cexy.io) REST and WebSocket API.
 
 ```toml
 [dependencies]
-cexy = "=0.1.0-dev.5"
+cexy = "=0.1.0-dev.6"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
 Cargo never picks a pre-release (a version with `-dev.N`) on its own: name it explicitly. The
-exact requirement above (`=0.1.0-dev.5`) is the safest way; move it by hand for each new pre-release.
+exact requirement above (`=0.1.0-dev.6`) is the safest way; move it by hand for each new pre-release.
 
 ## Quick start: public data
 
@@ -290,6 +290,44 @@ is revoked (`session.revoked` with `current: true`). The client emits `WsEvent::
 channels) and re-subscribes those channels itself: at once for another user, after the next
 successful `auth` otherwise, followed by `WsEvent::Resync(ResyncReason::Reauth)` (refetch private
 state).
+
+The server can also sign a connection out by itself: `signed_out` (a planned server frame; this
+SDK already handles it). Reason `expired` gives `WsEvent::AuthChanged` with `TokenExpired`, reason
+`revoked` gives `SessionRevoked` plus `WsEvent::AuthLost`, and any other reason gives `SignedOut`
+with the raw value in `code`. Call `auth` again with the fresh token on every token refresh; that
+keeps the private subscriptions.
+
+**Missed private events.** Every private frame carries a per-connection `sequence`. When numbers are
+skipped (after a short reorder window, `WsOptions::reorder_window`, default 250 ms), the client emits
+`WsEvent::SequenceGap` and `WsEvent::Resync(ResyncReason::SequenceGap)`: refetch that channel's
+state over REST. `balances.resync`, `deposits.resync` and `withdrawals.resync` (the last two
+planned) emit `Resync` with `BalancesResync`, `DepositsResync` or `WithdrawalsResync`.
+
+### Live balances
+
+```rust,no_run
+# async fn run(c: cexy::Client, token: &str) -> cexy::Result<()> {
+let ws = c.websocket(cexy::WsOptions::default())?; // c has an API key
+let mut events = ws.events().expect("events");
+ws.connect().await?;
+ws.auth(token).await?;
+let lb = ws.live_balances(cexy::LiveBalancesOptions::default()).await?;
+while let Some(ev) = events.recv().await {
+    if let cexy::WsEvent::Balances(cexy::BalancesEvent::Updated { asset, balance }) = ev {
+        println!("{asset}: {:?}", balance.map(|b| b.total));
+    }
+}
+let _ = (lb.get("USDT"), lb.is_stale(), lb.last_error());
+# Ok(()) }
+```
+
+`live_balances` subscribes `balances`, takes a REST snapshot and applies newer `balance.updated`
+events (only when their `sequence` is greater than the one it holds; a total of 0 removes the row).
+It refetches by itself on a missed event, `balances.resync`, `CONCURRENT_MODIFICATION`, a reconnect
+or an account change, at most every `min_snapshot_interval` (default 2 s; `Duration::ZERO`: none),
+and never because a balance's own sequence skipped values. Before every merge it checks that the
+REST key's account (`account().id()`) is the WebSocket's authenticated user: otherwise nothing is
+merged (`BalancesEvent::AccountMismatch`, and `last_error()` has code `ACCOUNT_MISMATCH`).
 
 ## Security
 

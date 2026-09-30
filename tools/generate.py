@@ -113,6 +113,11 @@ def doc(text: str | None, indent: str = "") -> str:
     return "".join(f"{indent}///{(' ' + doc_text(ln.strip())) if ln.strip() else ''}\n" for ln in lines)
 
 
+
+# Required fields that servers predating them omit: decode those with the type's default instead of
+# failing the whole object. Balance.sequence (live balances, 2026-09-30): 0 means "never touched".
+DEFAULT_WHEN_MISSING = {("Balance", "sequence")}
+
 class Gen:
     def __init__(self, spec: dict, surface: dict, error_codes: list[str]):
         self.spec = spec
@@ -231,6 +236,8 @@ class Gen:
         for prop in sorted(s["properties"]):
             ps = s["properties"][prop]
             typ, attr = self.field(ps, prop in required)
+            if (rname, prop) in DEFAULT_WHEN_MISSING and not attr:
+                attr = "#[serde(default)]"
             fname = snake(prop)
             lines.append(doc(ps.get("description"), "    ") or f"    /// `{prop}`\n")
             if fname.removeprefix("r#") != prop:

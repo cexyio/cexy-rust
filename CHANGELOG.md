@@ -6,6 +6,31 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-dev.6] (2026-09-30)
+
+### Added
+- `Account::id`: the account id of the API key (`GET /api/v1/account/id`, read scope).
+- `WebSocket::live_balances` / `LiveBalances`: live balances from a REST snapshot plus
+  `balance.updated` events. An event applies only when its `sequence` is greater than the stored
+  one (a total of 0 removes the row, and an older snapshot row cannot bring it back); a refetch
+  happens on a missed event, `balances.resync`, `CONCURRENT_MODIFICATION`, a reconnect or an account
+  change, at most every `min_snapshot_interval` (default 2 s), with retry backoff. Before every
+  merge the REST key's account (`Account::id`) must be the WebSocket's user, otherwise nothing is
+  merged (`BalancesEvent::AccountMismatch`). Events without `sequence` (older servers) always apply
+  and emit one `WsEvent::Warning`. `is_stale`, `last_error`, `get`, `all`, `close`; events through
+  `WsEvent::Balances` (`Updated`, `Snapshot`, `AccountMismatch`, `Error`).
+- WebSocket: frame-sequence tracking on private channels. A gap that is not filled within
+  `WsOptions::reorder_window` (default 250 ms) emits `WsEvent::SequenceGap` and
+  `Resync(ResyncReason::SequenceGap)`.
+- WebSocket: `balances.resync` (and the planned `deposits.resync` / `withdrawals.resync`) are known
+  events and emit `Resync` with `BalancesResync`, `DepositsResync` or `WithdrawalsResync`.
+- WebSocket: the planned `signed_out` server frame is handled as a server sign-out:
+  `AuthChangeReason::TokenExpired`, `SessionRevoked` plus `WsEvent::AuthLost` (synthetic
+  `session.revoked` frame with `data.reason` `"signed_out"`), or `SignedOut` with the raw reason in
+  `code`. The token is forgotten.
+- `Balance::sequence` (a missing value decodes as 0), `WebSocket::user_id`, `WsClock` / `WsTimer` /
+  `WsOptions::clock` (test-only time source).
+
 ## [0.1.0-dev.5] (2026-09-30)
 
 ### Fixed
