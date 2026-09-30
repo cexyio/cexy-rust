@@ -12,6 +12,11 @@ on:
 permissions:
   contents: read
 
+# The cexy-api-spec commit the spec and conformance tests run against. Pinned so that a spec
+# change cannot silently change what CI tests; bump it in a reviewed PR.
+env:
+  SPEC_COMMIT: 3597ebd8a7465092a5f23a8bc2d96d98b50b1e0c
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -27,7 +32,7 @@ jobs:
           git fetch --no-tags origin main
           git merge-base --is-ancestor "$GITHUB_SHA" origin/main
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with: {repository: cexyio/cexy-api-spec, path: cexy-api-spec, persist-credentials: false}
+        with: {repository: cexyio/cexy-api-spec, ref: "${{ env.SPEC_COMMIT }}", path: cexy-api-spec, persist-credentials: false}
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with: {toolchain: stable, components: rustfmt} # generate.py --check formats with rustfmt
       - name: Tag matches Cargo.toml version
