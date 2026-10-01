@@ -330,8 +330,8 @@ API key. `ws.auth_key().await` authenticates a WebSocket with the same key.
 
 The signed timestamp must be at most 30 s behind and 5 s ahead of the server clock: keep the system
 clock synchronised (NTP). After `SIGNATURE_EXPIRED` the client adopts the server clock (at most 1 h
-away) and resends once. For a few seconds after a server restart the API may answer
-`503 SERVICE_UNAVAILABLE` (`nonce_store_warming`); reads are retried after `Retry-After`.
+away) and resends once. For a few seconds after the API's replay-protection store restarts, it may
+answer `503 SERVICE_UNAVAILABLE` (`nonce_store_warming`); reads are retried after `Retry-After`.
 
 ### Live balances
 

@@ -7,6 +7,9 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- Error codes from the live API: `KEY_NOT_SIGNABLE`, `SIGNATURE_EXPIRED`, `NONCE_REUSED` and
+  `SIGNATURE_REQUIRED` (`ErrorCode` variants). `SIGNATURE_REQUIRED` is reserved: the API will return it
+  (400, not retryable) once header mode is switched off; switch to `hmac` before then.
 - Request signing, accepted by the API since 2026-10-01 (opt-in; the default is unchanged):
   `ClientOptions { auth: AuthScheme::Hmac, ..ClientOptions::with_api_key(key, secret) }` signs every
   private request (`CEXY-HMAC-SHA256-v1`: `X-API-Key`, `X-API-Timestamp`, `X-API-Nonce`,
