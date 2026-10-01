@@ -517,7 +517,7 @@ pub(crate) struct Inner {
 /// The CEXY.io WebSocket client. Cloning is cheap; clones share the connection.
 ///
 /// Private channels need [`WebSocket::auth`] with a session access token, or
-/// [`WebSocket::auth_key`] with an API key (on a client with `AuthScheme::Hmac`).
+/// [`WebSocket::auth_key`] with an API key (on a client that signs requests, the default).
 #[derive(Clone)]
 pub struct WebSocket {
     pub(crate) inner: Arc<Inner>,
@@ -719,7 +719,8 @@ impl WebSocket {
     /// signs the server's single-use challenge; the secret never leaves the process. After a
     /// reconnect it signs the new connection's challenge automatically. A refused `auth_key`
     /// stops the automatic re-authentication (the server closes the socket after 5 failures).
-    /// It needs a WebSocket from [`Client::websocket`] on a client with [`AuthScheme::Hmac`].
+    /// It needs a WebSocket from [`Client::websocket`] on a client that signs requests
+    /// ([`AuthScheme::Hmac`], the default).
     ///
     /// [`AuthScheme::Hmac`]: crate::AuthScheme::Hmac
     pub async fn auth_key(&self) -> Result<AuthResult> {

@@ -123,15 +123,38 @@ fn query_encoding_and_nonce() {
 }
 
 #[test]
-fn default_scheme_stays_headers() {
+fn signing_is_the_default_scheme() {
     let c = Client::new(ClientOptions::with_api_key(KEY, SECRET)).unwrap();
-    assert_eq!(c.t.auth.as_ref().unwrap().kind(), "api-key");
+    assert_eq!(c.t.auth.as_ref().unwrap().kind(), "hmac");
+    assert_eq!(AuthScheme::default(), AuthScheme::Hmac);
     let c = Client::new(ClientOptions {
-        auth: AuthScheme::Hmac,
+        auth: AuthScheme::Headers,
         ..ClientOptions::with_api_key(KEY, SECRET)
     })
     .unwrap();
-    assert_eq!(c.t.auth.as_ref().unwrap().kind(), "hmac");
+    assert_eq!(c.t.auth.as_ref().unwrap().kind(), "api-key");
+}
+
+#[tokio::test]
+async fn signature_required_names_the_fix_and_is_not_retried() {
+    use wiremock::matchers::any;
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(any())
+        .respond_with(wiremock::ResponseTemplate::new(400).set_body_json(json!({"error": {
+            "code": "SIGNATURE_REQUIRED",
+            "message": "This API key must sign its requests; sending the secret is no longer accepted.",
+            "retryable": false}})))
+        .mount(&server)
+        .await;
+    let (c, _) = super::helpers::client_with(&server, true, |o| o.auth = AuthScheme::Headers);
+    let e = c.account().balances().await.unwrap_err();
+    let api = e.api().unwrap();
+    assert_eq!(api.code.as_str(), "SIGNATURE_REQUIRED");
+    assert!(
+        api.message.contains("AuthScheme::Hmac") && !api.retryable,
+        "{e}"
+    );
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
 }
 
 #[test]
