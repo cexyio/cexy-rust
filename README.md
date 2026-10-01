@@ -278,9 +278,9 @@ the newest 256 updates to replay; older ones are dropped (`book.dropped_updates(
 `WsEvent::Warning`). Nothing is lost, since every update is a complete top 50.
 
 **Private channels** (`orders`, `balances`, `deposits`, `withdrawals`, `account`) need
-`ws.auth(token)` with a session access token (it returns the `user_id` from `authenticated`).
-**API-key authentication on the WebSocket is not available yet**: with an API key, use public channels
-and poll REST for private state. If the session is revoked, the client emits `WsEvent::AuthLost`;
+`ws.auth(token)` with a session access token (it returns the `user_id` from `authenticated`),
+or `ws.auth_key()` with an API key on a client with `AuthScheme::Hmac` (see
+[Request signing](#request-signing)). If the session is revoked, the client emits `WsEvent::AuthLost`;
 public channels keep working.
 
 The server ends private subscriptions, without any frame, when `auth` succeeds as another user,
@@ -303,10 +303,11 @@ skipped (after a short reorder window, `WsOptions::reorder_window`, default 250 
 state over REST. `balances.resync`, `deposits.resync` and `withdrawals.resync` (the last two
 planned) emit `Resync` with `BalancesResync`, `DepositsResync` or `WithdrawalsResync`.
 
-### Request signing (planned)
+### Request signing
 
-The API will accept signed requests instead of the secret header. The SDK is ready; keep the default
-until the API announces it:
+The API accepts signed requests (since 2026-10-01). Opt in with `AuthScheme::Hmac`; the default is
+still `AuthScheme::Headers`, which sends the secret in `X-API-Secret` (the API marks that mode
+`Deprecation: true`):
 
 ```rust
 use cexy::{AuthScheme, Client, ClientOptions};
@@ -326,6 +327,11 @@ With `AuthScheme::Hmac` the secret never leaves your process: every private requ
 (`X-API-Key`, `X-API-Timestamp`, `X-API-Nonce`, `X-API-Signature`), every retry with a fresh
 timestamp and nonce. A key issued before signing existed fails with `KEY_NOT_SIGNABLE`: create a new
 API key. `ws.auth_key().await` authenticates a WebSocket with the same key.
+
+The signed timestamp must be at most 30 s behind and 5 s ahead of the server clock: keep the system
+clock synchronised (NTP). After `SIGNATURE_EXPIRED` the client adopts the server clock (at most 1 h
+away) and resends once. For a few seconds after a server restart the API may answer
+`503 SERVICE_UNAVAILABLE` (`nonce_store_warming`); reads are retried after `Retry-After`.
 
 ### Live balances
 

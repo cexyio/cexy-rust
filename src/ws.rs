@@ -71,8 +71,7 @@ pub struct Welcome {
     /// Connection id, for support requests.
     #[serde(default)]
     pub connection_id: String,
-    /// The single-use challenge that [`WebSocket::auth_key`] signs (planned; absent until the
-    /// server supports API-key authentication).
+    /// The single-use challenge that [`WebSocket::auth_key`] signs.
     #[serde(default)]
     pub challenge: Option<String>,
 }
@@ -268,10 +267,10 @@ pub enum AuthChangeReason {
     TokenExpired,
     /// A server sign-out with a reason this SDK does not know (raw value in `code`).
     SignedOut,
-    /// The API key was revoked or deleted (planned key authentication, `signed_out` reason
+    /// The API key was revoked or deleted (key authentication, `signed_out` reason
     /// `key_revoked`). Automatic key re-authentication stops.
     KeyRevoked,
-    /// The API key expired (planned key authentication, `signed_out` reason `key_expired`).
+    /// The API key expired (key authentication, `signed_out` reason `key_expired`).
     /// Automatic key re-authentication stops.
     KeyExpired,
 }
@@ -517,9 +516,8 @@ pub(crate) struct Inner {
 
 /// The CEXY.io WebSocket client. Cloning is cheap; clones share the connection.
 ///
-/// [`WebSocket::auth`] takes a session access token. API-key authentication
-/// ([`WebSocket::auth_key`]) is planned: the server does not accept it yet, so programs holding
-/// only an API key get public channels and poll REST for private state.
+/// Private channels need [`WebSocket::auth`] with a session access token, or
+/// [`WebSocket::auth_key`] with an API key (on a client with `AuthScheme::Hmac`).
 #[derive(Clone)]
 pub struct WebSocket {
     pub(crate) inner: Arc<Inner>,
@@ -717,7 +715,7 @@ impl WebSocket {
         Inner::auth(&self.inner, token).await
     }
 
-    /// Authenticates with the client's API key (PLANNED: the server does not accept it yet). It
+    /// Authenticates with the client's API key. It
     /// signs the server's single-use challenge; the secret never leaves the process. After a
     /// reconnect it signs the new connection's challenge automatically. A refused `auth_key`
     /// stops the automatic re-authentication (the server closes the socket after 5 failures).
