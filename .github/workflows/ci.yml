@@ -6,6 +6,9 @@ permissions:
   contents: read
 
 env:
+  # The cexy-api-spec commit the spec and conformance tests run against. Pinned so that a spec
+  # change cannot silently change what CI tests; bump it in a reviewed PR.
+  SPEC_COMMIT: d47c2857056f824a100c992f529cd753629fd9c8
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
 
@@ -19,7 +22,7 @@ jobs:
         with: {path: cexy-rust, fetch-depth: 0, persist-credentials: false}
       # The shared spec and conformance cases live in cexy-api-spec, checked out next to this repo.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with: {repository: cexyio/cexy-api-spec, path: cexy-api-spec, persist-credentials: false}
+        with: {repository: cexyio/cexy-api-spec, ref: "${{ env.SPEC_COMMIT }}", path: cexy-api-spec, persist-credentials: false}
       # dtolnay/rust-toolchain has no release tags; pinned to a master commit (2026-09-12).
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with: {toolchain: stable, components: "rustfmt, clippy"}
@@ -78,7 +81,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with: {path: cexy-rust, persist-credentials: false}
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with: {repository: cexyio/cexy-api-spec, path: cexy-api-spec, persist-credentials: false}
+        with: {repository: cexyio/cexy-api-spec, ref: "${{ env.SPEC_COMMIT }}", path: cexy-api-spec, persist-credentials: false}
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with: {toolchain: "${{ matrix.rust }}"}
       - name: Unit, conformance and WebSocket tests (offline)

@@ -13,6 +13,7 @@ use crate::limiter::{RateLimitState, RateLimiter};
 use crate::models_gen::{ExchangeConfig, ServerTime};
 use crate::operations_gen::OperationId;
 use crate::services::{Account, Assets, Exports, Fees, Markets, Networks, Pools, Trading, Wallet};
+use crate::signing::HmacAuthenticator;
 use crate::transport::{
     Call, Random, Resolved, RetryHook, RetryInfo, Transport, decode_data, origin,
 };
@@ -29,6 +30,19 @@ pub const DEFAULT_RPM_ANONYMOUS: u32 = 100;
 /// Default client-side limit with an API key (the server allows about 600 a minute per key).
 pub const DEFAULT_RPM_WITH_KEY: u32 = 300;
 
+/// How a [`Client`] sends `api_key` and `api_secret`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum AuthScheme {
+    /// `X-API-Key` and `X-API-Secret` headers (today's scheme).
+    #[default]
+    Headers,
+    /// PLANNED, not accepted by the API yet: every private request is signed
+    /// ([`HmacAuthenticator`]) and the secret never leaves the process. A key issued before
+    /// signing existed fails with `KEY_NOT_SIGNABLE` (create a new key); there is no fallback.
+    Hmac,
+}
+
 /// Configures a [`Client`]. The default gives an anonymous client for public data.
 #[derive(Clone, Default)]
 pub struct ClientOptions {
@@ -36,8 +50,10 @@ pub struct ClientOptions {
     pub api_key: Option<String>,
     /// API key secret. Never logged, never put in a URL.
     pub api_secret: Option<String>,
-    /// A custom credentials scheme (for example request signing once the API supports it).
-    /// Mutually exclusive with `api_key`/`api_secret`.
+    /// How `api_key`/`api_secret` are sent. Default [`AuthScheme::Headers`]; keep it until the
+    /// API announces request signing.
+    pub auth: AuthScheme,
+    /// A custom credentials scheme. Mutually exclusive with `api_key`/`api_secret`.
     pub authenticator: Option<Arc<dyn Authenticator>>,
     /// Default [`DEFAULT_BASE_URL`]. Must be `https://` (see `allow_insecure`).
     pub base_url: Option<String>,
@@ -78,6 +94,7 @@ impl fmt::Debug for ClientOptions {
             .field("base_url", &self.base_url)
             .field("api_key", &key)
             .field("api_secret", &self.api_secret.as_ref().map(|_| REDACTED))
+            .field("auth", &self.auth)
             .field(
                 "authenticator",
                 &self.authenticator.as_ref().map(|a| a.kind().to_string()),
@@ -128,9 +145,14 @@ impl Client {
                         "pass either api_key/api_secret or authenticator, not both",
                     ));
                 }
-                (Some(k), Some(s), None) => {
-                    Some(Arc::new(ApiKeyAuthenticator::new(k.clone(), s.clone())?))
-                }
+                (Some(k), Some(s), None) => match o.auth {
+                    AuthScheme::Hmac => {
+                        Some(Arc::new(HmacAuthenticator::new(k.clone(), s.clone())?))
+                    }
+                    AuthScheme::Headers => {
+                        Some(Arc::new(ApiKeyAuthenticator::new(k.clone(), s.clone())?))
+                    }
+                },
                 (None, None, a) => a.clone(),
             };
 

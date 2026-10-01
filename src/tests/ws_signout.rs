@@ -40,6 +40,8 @@ pub(super) fn tracked(ev: WsEvent) -> Option<Value> {
                 AuthChangeReason::AuthFailed => "auth_failed",
                 AuthChangeReason::SessionRevoked => "session_revoked",
                 AuthChangeReason::TokenExpired => "token_expired",
+                AuthChangeReason::KeyRevoked => "key_revoked",
+                AuthChangeReason::KeyExpired => "key_expired",
                 AuthChangeReason::SignedOut => "signed_out",
             };
             let mut v = json!({"type": "auth_changed", "reason": reason, "previous_user_id": a.previous_user_id,
