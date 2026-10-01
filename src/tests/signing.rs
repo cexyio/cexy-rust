@@ -307,7 +307,7 @@ async fn raw_server(reply: Reply) -> (String, Arc<Mutex<Vec<Seen>>>) {
                             valid,
                         };
                         seen.lock().unwrap().push(s.clone());
-                        let (status, v) = if valid {
+                        let (status, mut v) = if valid {
                             reply(&s, n.fetch_add(1, Ordering::SeqCst) + 1)
                         } else {
                             (
@@ -315,9 +315,15 @@ async fn raw_server(reply: Reply) -> (String, Arc<Mutex<Vec<Seen>>>) {
                                 json!({"error": {"code": "INVALID_SIGNATURE", "message": "bad signature", "retryable": false}}),
                             )
                         };
+                        // A top-level "__retry_after" in a reply becomes a Retry-After header.
+                        let retry_after = v
+                            .as_object_mut()
+                            .and_then(|o| o.remove("__retry_after"))
+                            .map(|r| format!("retry-after: {}\r\n", r.as_str().unwrap_or("")))
+                            .unwrap_or_default();
                         let b = v.to_string();
                         let resp = format!(
-                            "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{b}",
+                            "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\n{retry_after}content-length: {}\r\n\r\n{b}",
                             b.len()
                         );
                         if tcp.write_all(resp.as_bytes()).await.is_err() {
@@ -462,6 +468,50 @@ async fn signature_expired_resends_once_with_the_server_clock() {
         seen[0].headers["x-api-nonce"],
         seen[1].headers["x-api-nonce"]
     );
+}
+
+#[tokio::test]
+async fn nonce_store_warming_waits_retry_after_and_keeps_the_offset() {
+    let (base, seen) = raw_server(Arc::new(|_: &Seen, n| {
+        if n == 1 {
+            (
+                503,
+                json!({"__retry_after": "2", "error": {"code": "SERVICE_UNAVAILABLE", "message": "x",
+                       "retryable": true, "details": {"reason": "nonce_store_warming"}}}),
+            )
+        } else {
+            (200, json!({"data": []}))
+        }
+    }))
+    .await;
+    let a = Arc::new(
+        HmacAuthenticator::new(KEY, SECRET)
+            .unwrap()
+            .with_sources(Arc::new(|| T0), None),
+    );
+    let clock = FakeClock::default();
+    let o = ClientOptions {
+        base_url: Some(base),
+        allow_insecure: true,
+        disable_rate_limit: true,
+        authenticator: Some(a.clone()),
+        ..Default::default()
+    };
+    let c = Client::build(o, Arc::new(clock.clone()), Arc::new(|| 0.5)).unwrap();
+    c.account().balances().await.unwrap();
+    let seen = seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 2);
+    assert_ne!(
+        seen[0].headers["x-api-nonce"],
+        seen[1].headers["x-api-nonce"]
+    );
+    let sleeps = clock.sleeps();
+    assert_eq!(sleeps.len(), 1, "{sleeps:?}");
+    assert!(
+        sleeps[0] >= Duration::from_secs(2) && sleeps[0] <= Duration::from_secs(3),
+        "{sleeps:?}"
+    );
+    assert_eq!(a.clock_offset_ms(), 0, "warming must not touch the clock");
 }
 
 #[tokio::test]
