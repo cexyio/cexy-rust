@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-dev.7] (2026-10-01)
+
 ### Added
 - Error codes from the live API: `KEY_NOT_SIGNABLE`, `SIGNATURE_EXPIRED`, `NONCE_REUSED` and
   `SIGNATURE_REQUIRED` (`ErrorCode` variants). `SIGNATURE_REQUIRED` is reserved: the API will return it
