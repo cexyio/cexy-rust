@@ -810,6 +810,10 @@ async fn a_late_auth_key_reply_racing_a_reconnect() {
     ws.connect().await.unwrap();
     server.silent.store(true, Ordering::SeqCst); // the reply is held back
     assert!(ws.auth_key().await.is_err(), "expected a timeout");
+    eventually("server held the reply", || {
+        server.held.lock().unwrap().is_some()
+    })
+    .await;
     server.silent.store(false, Ordering::SeqCst);
     server.release(); // the late reply (with its next challenge) arrives ...
     server.drop_last(); // ... as the connection drops
@@ -839,6 +843,7 @@ async fn a_challenge_is_consumed_when_signed() {
         matches!(&e, Error::WebSocket(w) if w.code == "NO_CHALLENGE"),
         "{e}"
     );
+    eventually("server saw the frame", || server.sent().len() == 1).await;
     assert_eq!(server.sent().len(), 1);
 }
 
@@ -849,6 +854,10 @@ async fn a_late_refusal_stops_automatic_key_reauth() {
     ws.connect().await.unwrap();
     server.silent.store(true, Ordering::SeqCst);
     assert!(ws.auth_key().await.is_err());
+    eventually("server held the reply", || {
+        server.held.lock().unwrap().is_some()
+    })
+    .await;
     let id = server.sent()[0]["id"].clone();
     server.push_last(json!({"type": "error", "code": "UNAUTHENTICATED", "message": "bad key", "challenge": "late", "id": id}));
     eventually("key auth cleared", || !ws.inner.st.lock().unwrap().key_auth).await;
