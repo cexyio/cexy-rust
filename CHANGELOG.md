@@ -7,7 +7,10 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
-- Request signing, **planned** (the API does not accept it yet; the default is unchanged):
+- Error codes from the live API: `KEY_NOT_SIGNABLE`, `SIGNATURE_EXPIRED`, `NONCE_REUSED` and
+  `SIGNATURE_REQUIRED` (`ErrorCode` variants). `SIGNATURE_REQUIRED` is reserved: the API will return it
+  (400, not retryable) once header mode is switched off; switch to `hmac` before then.
+- Request signing, accepted by the API since 2026-10-01 (opt-in; the default is unchanged):
   `ClientOptions { auth: AuthScheme::Hmac, ..ClientOptions::with_api_key(key, secret) }` signs every
   private request (`CEXY-HMAC-SHA256-v1`: `X-API-Key`, `X-API-Timestamp`, `X-API-Nonce`,
   `X-API-Signature`) instead of sending `X-API-Secret`. Every attempt, retries included, is signed
@@ -18,7 +21,7 @@ All notable changes to this project are documented here. The format follows
   received. `HmacAuthenticator`, `SIGNING_SCHEME` and `MAX_CLOCK_OFFSET` are exported; the
   `Authenticator` trait gains `adjust_clock` and `sign_websocket_challenge`, with defaults.
   `ring` (already used through rustls) is now a direct dependency for HMAC, SHA-256 and the nonce.
-- `WebSocket::auth_key`, **planned**: authenticates with the client's API key by signing the
+- `WebSocket::auth_key`: authenticates with the client's API key by signing the
   server's single-use challenge. It re-signs the new challenge after each reconnect, stops
   automatic key re-auth after a refused key, and reports `AuthChangeReason::KeyRevoked` /
   `KeyExpired` sign-outs. It needs a WebSocket from `Client::websocket` on an `AuthScheme::Hmac`

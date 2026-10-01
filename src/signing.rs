@@ -1,5 +1,5 @@
-//! HMAC request signing (`CEXY-HMAC-SHA256-v1`). PLANNED: the API does not accept signed requests
-//! yet; clients keep the default [`AuthScheme::Headers`](crate::AuthScheme) until it does.
+//! HMAC request signing (`CEXY-HMAC-SHA256-v1`), accepted by the API since 2026-10-01. Opt in with
+//! [`AuthScheme::Hmac`](crate::AuthScheme); the default is still `AuthScheme::Headers`.
 //!
 //! Canonical request: 7 lines joined by `\n` (no trailing newline): the scheme, the method, the
 //! canonical path, the canonical query, the timestamp (unix ms), the nonce and the hex SHA-256 of
@@ -173,7 +173,7 @@ fn system_now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-/// Signs every private request (PLANNED scheme, see [`SIGNING_SCHEME`]). The secret never leaves
+/// Signs every private request (see [`SIGNING_SCHEME`]). The secret never leaves
 /// the process: only `X-API-Key`, `X-API-Timestamp`, `X-API-Nonce` and `X-API-Signature` are sent.
 /// Called once per attempt, so every retry has a fresh timestamp and nonce.
 ///
