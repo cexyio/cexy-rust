@@ -1,5 +1,5 @@
-//! HMAC request signing (`CEXY-HMAC-SHA256-v1`), accepted by the API since 2026-10-01. Opt in with
-//! [`AuthScheme::Hmac`](crate::AuthScheme); the default is still `AuthScheme::Headers`.
+//! HMAC request signing (`CEXY-HMAC-SHA256-v1`): the default ([`AuthScheme::Hmac`](crate::AuthScheme)).
+//! The API refuses the old secret header with `SIGNATURE_REQUIRED`.
 //!
 //! Canonical request: 7 lines joined by `\n` (no trailing newline): the scheme, the method, the
 //! canonical path, the canonical query, the timestamp (unix ms), the nonce and the hex SHA-256 of

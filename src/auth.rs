@@ -57,8 +57,9 @@ pub trait Authenticator: Send + Sync + 'static {
     }
 }
 
-/// The default scheme: `X-API-Key` and `X-API-Secret` headers on every private request. HMAC
-/// request signing ([`crate::HmacAuthenticator`]) is the other scheme.
+/// The old scheme (`AuthScheme::Headers`): `X-API-Key` and `X-API-Secret` headers on every
+/// private request. The API is switching it off (`SIGNATURE_REQUIRED`); the default is request
+/// signing ([`crate::HmacAuthenticator`]).
 ///
 /// Its `Debug` and `Display` never reveal the secret.
 #[derive(Clone)]

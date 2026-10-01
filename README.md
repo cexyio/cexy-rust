@@ -15,12 +15,12 @@ The official Rust SDK for the [CEXY.io](https://cexy.io) REST and WebSocket API.
 
 ```toml
 [dependencies]
-cexy = "=0.1.0-dev.7"
+cexy = "=0.1.0-dev.8"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
 Cargo never picks a pre-release (a version with `-dev.N`) on its own: name it explicitly. The
-exact requirement above (`=0.1.0-dev.7`) is the safest way; move it by hand for each new pre-release.
+exact requirement above (`=0.1.0-dev.8`) is the safest way; move it by hand for each new pre-release.
 
 ## Quick start: public data
 
@@ -279,7 +279,7 @@ the newest 256 updates to replay; older ones are dropped (`book.dropped_updates(
 
 **Private channels** (`orders`, `balances`, `deposits`, `withdrawals`, `account`) need
 `ws.auth(token)` with a session access token (it returns the `user_id` from `authenticated`),
-or `ws.auth_key()` with an API key on a client with `AuthScheme::Hmac` (see
+or `ws.auth_key()` with an API key (see
 [Request signing](#request-signing)). If the session is revoked, the client emits `WsEvent::AuthLost`;
 public channels keep working.
 
@@ -305,25 +305,23 @@ planned) emit `Resync` with `BalancesResync`, `DepositsResync` or `WithdrawalsRe
 
 ### Request signing
 
-The API accepts signed requests (since 2026-10-01). Opt in with `AuthScheme::Hmac`; the default is
-still `AuthScheme::Headers`, which sends the secret in `X-API-Secret` (the API marks that mode
-`Deprecation: true`):
+Every private request is signed (`AuthScheme::Hmac`, the default since 0.1.0-dev.8). The API is
+switching off the old mode that sent the secret in `X-API-Secret`, and refuses it with
+`SIGNATURE_REQUIRED`:
 
 ```rust
-use cexy::{AuthScheme, Client, ClientOptions};
+use cexy::{Client, ClientOptions};
 
 # async fn run(key: String, secret: String) -> cexy::Result<()> {
-let client = Client::new(ClientOptions {
-    auth: AuthScheme::Hmac, // default: AuthScheme::Headers
-    ..ClientOptions::with_api_key(key, secret)
-})?;
+// Signs requests; same as `auth: AuthScheme::Hmac`.
+let client = Client::new(ClientOptions::with_api_key(key, secret))?;
 let ws = client.websocket(Default::default())?;
 ws.connect().await?;
 ws.auth_key().await?;
 # Ok(()) }
 ```
 
-With `AuthScheme::Hmac` the secret never leaves your process: every private request is signed
+The secret never leaves your process: every private request is signed
 (`X-API-Key`, `X-API-Timestamp`, `X-API-Nonce`, `X-API-Signature`), every retry with a fresh
 timestamp and nonce. A key issued before signing existed fails with `KEY_NOT_SIGNABLE`: create a new
 API key. `ws.auth_key().await` authenticates a WebSocket with the same key.
@@ -365,7 +363,8 @@ own `snapshot` source, also pass its owner (`owner_id` or `account_id`); without
 
 - API keys **cannot withdraw or transfer funds**, whatever their scopes.
 - Use a **read-only** key unless you need to trade, and restrict keys to your IPs (`allowed_ips`).
-- Credentials go only in the `X-API-Key` / `X-API-Secret` headers and only on private endpoints; never in URLs.
+- Credentials are sent only on private endpoints and never in URLs: the key id and a signature
+  (`X-API-Key`, `X-API-Timestamp`, `X-API-Nonce`, `X-API-Signature`). The secret itself is never sent.
 - The SDK **never follows HTTP redirects**, so credentials and orders are never re-sent to another URL.
   A 3xx response becomes an API error with code `UNEXPECTED_REDIRECT` (category `UnexpectedRedirect`);
   it is not retried. The WebSocket handshake does not follow redirects either.

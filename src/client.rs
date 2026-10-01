@@ -34,12 +34,13 @@ pub const DEFAULT_RPM_WITH_KEY: u32 = 300;
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum AuthScheme {
-    /// `X-API-Key` and `X-API-Secret` headers (the default).
-    #[default]
+    /// `X-API-Key` and `X-API-Secret` headers. The API is switching this off
+    /// (`SIGNATURE_REQUIRED`); kept only for servers that still accept it.
     Headers,
-    /// Accepted by the API since 2026-10-01: every private request is signed
-    /// ([`HmacAuthenticator`]) and the secret never leaves the process. A key issued before
-    /// signing existed fails with `KEY_NOT_SIGNABLE` (create a new key); there is no fallback.
+    /// The default: every private request is signed ([`HmacAuthenticator`]) and the secret
+    /// never leaves the process. A key issued before signing existed fails with
+    /// `KEY_NOT_SIGNABLE` (create a new key); there is no fallback.
+    #[default]
     Hmac,
 }
 
@@ -50,8 +51,8 @@ pub struct ClientOptions {
     pub api_key: Option<String>,
     /// API key secret. Never logged, never put in a URL.
     pub api_secret: Option<String>,
-    /// How `api_key`/`api_secret` are sent. Default [`AuthScheme::Headers`];
-    /// [`AuthScheme::Hmac`] signs every request instead.
+    /// How `api_key`/`api_secret` are used. Default [`AuthScheme::Hmac`] (request signing);
+    /// [`AuthScheme::Headers`] sends the secret header, which the API is switching off.
     pub auth: AuthScheme,
     /// A custom credentials scheme. Mutually exclusive with `api_key`/`api_secret`.
     pub authenticator: Option<Arc<dyn Authenticator>>,

@@ -6,6 +6,17 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-dev.8] (2026-10-01)
+
+### Changed
+- **Request signing is the default.** `AuthScheme::default()` is now `AuthScheme::Hmac`, so
+  `ClientOptions::with_api_key(key, secret)` signs every private request; the secret is never
+  sent. The API is switching off the old `X-API-Secret` mode. `AuthScheme::Headers` still selects
+  it, for servers that accept it. Earlier versions default to `Headers` and stop working against
+  the API once it refuses the secret, unless they set `AuthScheme::Hmac`: upgrade.
+- `SIGNATURE_REQUIRED` (400, the API refuses the secret header) is never retried and its message
+  names the fix (`AuthScheme::Hmac`).
+
 ## [0.1.0-dev.7] (2026-10-01)
 
 ### Added

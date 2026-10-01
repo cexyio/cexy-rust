@@ -188,6 +188,13 @@ impl Transport {
             Err(Error::Api(e)) => e,
             other => return other,
         };
+        if e.code.as_str() == "SIGNATURE_REQUIRED" {
+            e.message = "this API key must sign its requests: use AuthScheme::Hmac (the default) \
+                         instead of AuthScheme::Headers"
+                .into();
+            e.retryable = false;
+            return Err(Error::Api(e));
+        }
         if e.code.as_str() == "KEY_NOT_SIGNABLE" {
             e.message =
                 "create a new API key; keys issued before request signing can't sign".into();
