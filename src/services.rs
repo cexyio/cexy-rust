@@ -811,8 +811,8 @@ impl<'a> Futures<'a> {
     /// An empty page whose `next_cursor` is the cursor just sent means the provider is busy: the
     /// SDK waits (its retry backoff) and asks again with the same cursor, at most 3 times in a row
     /// ([`Futures::with_max_busy_retries`]), then yields [`Error::PagingStalled`] (retryable; the rows
-    /// before it are not the whole history). A page with rows whose `next_cursor` was already sent
-    /// yields its rows, then [`Error::PagingCursorRepeated`] (not retryable). Without a futures
+    /// before it are not the whole history). A page with rows whose `next_cursor` is the cursor just
+    /// sent yields its rows, then [`Error::PagingCursorRepeated`] (not retryable). Without a futures
     /// account the stream is empty. `max_items` stops the stream after that many items in total.
     pub fn all_fills(&self, max_items: Option<usize>) -> ItemStream<'a, FuturesFill> {
         let this = *self;

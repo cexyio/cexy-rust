@@ -106,7 +106,6 @@ struct HistoryState<F, W, T> {
     cursor: Option<String>,
     retries: u32,
     buffer: VecDeque<T>,
-    seen: HashSet<String>,
     yielded: usize,
     max_items: Option<usize>,
     done: bool,
@@ -123,8 +122,8 @@ struct HistoryState<F, W, T> {
 ///   (the transport's backoff, on the client's clock) and ask for the same cursor again, at most
 ///   `max_busy_retries` times in a row (its own setting, not the client's request retries), then
 ///   yield [`Error::PagingStalled`] (retryable) and stop;
-/// - a page WITH rows whose `next_cursor` was already sent would repeat rows: its rows are
-///   yielded, then [`Error::PagingCursorRepeated`] (not retryable), never a loop;
+/// - a page WITH rows whose `next_cursor` is the cursor just sent would repeat itself: its rows
+///   are yielded, then [`Error::PagingCursorRepeated`] (not retryable), never a loop;
 /// - `has_account` false ends the stream with no rows.
 pub(crate) fn paginate_history<'a, T, F, Fut, W, WFut>(
     operation: &'static str,
@@ -148,7 +147,6 @@ where
         cursor: None,
         retries: 0,
         buffer: VecDeque::new(),
-        seen: HashSet::new(),
         yielded: 0,
         max_items,
         done: false,
@@ -194,9 +192,10 @@ where
             }
             s.retries = 0;
             s.buffer.extend(page.rows);
-            match next {
+            // Only the cursor just sent counts as repeated (the spec's rule, as in the other SDKs).
+            match next.filter(|n| !n.is_empty()) {
                 None => s.done = true,
-                Some(n) if !s.seen.insert(n.clone()) => {
+                Some(n) if s.cursor.as_ref() == Some(&n) => {
                     s.done = true;
                     // The rows of this page first, then the error.
                     s.pending = Some(Error::PagingCursorRepeated {

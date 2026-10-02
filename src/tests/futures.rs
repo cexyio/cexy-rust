@@ -334,7 +334,7 @@ async fn a_cursor_sent_twice_after_rows_fails_instead_of_looping() {
         .respond_with(Sequence::new(vec![
             page(vec![fill("f1", 3)], Some("a")),
             page(vec![fill("f2", 2)], Some("b")),
-            page(vec![fill("f3", 1)], Some("a")),
+            page(vec![fill("f3", 1)], Some("b")),
         ]))
         .mount(&s)
         .await;
@@ -348,7 +348,7 @@ async fn a_cursor_sent_twice_after_rows_fails_instead_of_looping() {
     assert_eq!(ids, ["f1", "f2", "f3"]);
     let e = items.last().unwrap().as_ref().unwrap_err();
     assert!(
-        matches!(e, Error::PagingCursorRepeated { operation: "fills", cursor } if cursor == "a"),
+        matches!(e, Error::PagingCursorRepeated { operation: "fills", cursor } if cursor == "b"),
         "{e:?}"
     );
     assert_eq!(e.code(), Some(PAGING_CURSOR_REPEATED));

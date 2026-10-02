@@ -41,7 +41,7 @@ pub const PRIVATE_CHANNELS: [&str; 6] = [
 ];
 
 /// The longest client ping interval: the server closes a connection whose client is silent for
-/// 90 to 120 s. A longer `WsOptions::ping_interval` is lowered to this.
+/// 90 to 120 s. A longer `WsOptions::ping_interval` is a configuration error.
 pub const MAX_PING_INTERVAL: Duration = Duration::from_secs(60);
 
 const MAX_CHANNEL_LENGTH: usize = 64;
@@ -176,9 +176,9 @@ pub struct SubscribeResult {
     pub refused: Vec<String>,
     /// Channels already held (nothing was sent for them).
     pub already_subscribed: Vec<String>,
-    /// Channels the server refused, with its error. Each `futures.*` channel is sent in a request
-    /// of its own, so its refusal names it. They are not held and not retried automatically (WS
-    /// error frames carry no retry hint: back off yourself after `RATE_LIMITED`).
+    /// Channels the server refused, with its error (one error frame per refused channel, in the
+    /// order sent). They are not held and not retried automatically (WebSocket error frames carry
+    /// no retry hint: back off yourself after `RATE_LIMITED`).
     pub rejected: Vec<(String, WsError)>,
     /// Private channels held until [`WebSocket::auth`] or [`WebSocket::auth_key`] succeeds
     /// (`futures.account` on a connection that is not signed in): nothing was sent yet.
@@ -221,13 +221,15 @@ pub enum ResyncReason {
 #[derive(Default)]
 struct SubscribeOutcome {
     added: Vec<String>,
-    /// `futures.*` channels the server refused (each was sent alone).
+    /// Channels the server refused, with its error.
     rejected: Vec<(String, WsError)>,
-    /// The other channels, sent together.
-    batch: Vec<String>,
-    /// The failure of the batch request, or a local failure of a futures request.
+    /// No answer: not connected, disconnected, or a local limit.
     error: Option<Error>,
 }
+
+/// An acknowledgement and the error frames that came before it with the same id (a subscribe's
+/// refusals), or the error that answered the request.
+type Reply = std::result::Result<(Value, Vec<WsError>), WsError>;
 
 /// Carried by [`WsEvent::SequenceGap`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -439,7 +441,7 @@ pub struct WsOptions {
     /// Allow `ws://`, but ONLY for localhost, 127.0.0.1 or ::1 (local test servers).
     pub allow_insecure: bool,
     /// Client ping cadence, required by the server. Default 30 s; at most
-    /// [`MAX_PING_INTERVAL`] (a longer value is lowered to it).
+    /// [`MAX_PING_INTERVAL`] (a longer value is an [`Error::Config`] when the WebSocket is built).
     pub ping_interval: Duration,
     /// Reconnect when no frame arrives for this long. Default 75 s.
     pub liveness_timeout: Duration,
@@ -501,7 +503,10 @@ impl Default for WsOptions {
 struct Pending {
     kind: &'static str,
     channels: Vec<String>,
-    tx: oneshot::Sender<std::result::Result<Value, WsError>>,
+    /// Error frames with this subscribe's id: one per refused channel, before the single
+    /// `subscribed` ack, and no ack at all when every channel was refused.
+    errors: Vec<WsError>,
+    tx: oneshot::Sender<Reply>,
 }
 
 #[derive(Default)]
@@ -643,7 +648,12 @@ impl WebSocket {
                 *v = dv;
             }
         }
-        opts.ping_interval = opts.ping_interval.min(MAX_PING_INTERVAL);
+        if opts.ping_interval > MAX_PING_INTERVAL {
+            return Err(Error::config(format!(
+                "ping_interval must be at most {} s (the server closes connections whose client is silent for 90 s)",
+                MAX_PING_INTERVAL.as_secs()
+            )));
+        }
         if opts.max_subscriptions == 0 {
             opts.max_subscriptions = d.max_subscriptions;
         }
@@ -807,11 +817,13 @@ impl WebSocket {
     /// when the server confirms. Channels beyond `max_subscriptions` are refused locally. When
     /// not connected, channels are queued and subscribed on connect.
     ///
-    /// Futures channels ([`crate::FuturesChannel`]) are checked locally (a bad coin or interval is
-    /// an [`Error::Config`]) and each is sent in a request of its own, so that a refusal names its
-    /// channel: refused ones are in [`SubscribeResult::rejected`] (an error when every channel
-    /// sent was refused), are not held and are not retried. `futures.account` on a connection
-    /// that is not signed in is held in [`SubscribeResult::pending`] until auth succeeds.
+    /// Channels the server refuses (one error frame each, before the `subscribed` ack of the
+    /// others) are in [`SubscribeResult::rejected`]; it fails only when every channel sent was
+    /// refused. Refused channels are not held and not retried. No answer at all within
+    /// `ack_timeout` is a `TIMEOUT` error; those channels stay held (a reconnect sends them again). Futures channel names
+    /// ([`crate::FuturesChannel`]) are checked locally (a bad coin or interval is an
+    /// [`Error::Config`]). `futures.account` on a connection that is not signed in is held in
+    /// [`SubscribeResult::pending`] until auth succeeds.
     pub async fn subscribe(&self, channels: &[&str]) -> Result<SubscribeResult> {
         let wanted = uniq(channels.iter().map(|c| c.to_string()));
         if let Some(bad) = wanted
@@ -867,24 +879,18 @@ impl WebSocket {
         if accepted.is_empty() || !connected {
             return Ok(res);
         }
-        let out = Inner::subscribe_split(&self.inner, accepted.clone()).await;
-        res.added = out.added;
-        for (c, w) in &out.rejected {
-            self.inner.refused(c, w);
-        }
+        let out = Inner::subscribe_all(&self.inner, accepted.clone()).await;
         if let Some(e) = out.error {
-            if let Error::WebSocket(w) = &e
-                && w.from_server
-            {
-                // Refused by the server (e.g. UNAUTHENTICATED for a private channel): not held.
-                self.inner
-                    .st
-                    .lock()
-                    .unwrap()
-                    .channels
-                    .retain(|c| !out.batch.contains(c));
-            }
             return Err(e);
+        }
+        res.added = out.added;
+        {
+            // Refused by the server (e.g. UNAUTHENTICATED for a private channel, RATE_LIMITED
+            // for a futures feed): not held, not retried.
+            let mut s = self.inner.st.lock().unwrap();
+            for (c, _) in &out.rejected {
+                s.channels.retain(|x| x != c);
+            }
         }
         if out.rejected.len() == accepted.len()
             && let Some((_, w)) = out.rejected.first()
@@ -1141,14 +1147,7 @@ impl Inner {
                         .collect::<Vec<_>>()
                 };
                 if !channels.is_empty() {
-                    let out = Inner::subscribe_split(&inner, channels).await;
-                    for (c, w) in out.rejected {
-                        inner.refused(&c, &w);
-                        inner.emit_error(w.into());
-                    }
-                    if let Some(e) = out.error {
-                        inner.emit_error(e);
-                    }
+                    Inner::resubscribe(&inner, channels).await;
                 }
             });
         }
@@ -1228,47 +1227,38 @@ impl Inner {
         Ok(auth_result(&ack))
     }
 
-    /// Subscribes `channels`: every `futures.*` channel in a request of its own (the server sends
-    /// a refusal as an error frame that does not name the channel, before the one ack of the
-    /// request, and no ack when nothing was accepted), the others together. The frames are sent
-    /// in that order at once; the acknowledgements are awaited together.
-    async fn subscribe_split(this: &Arc<Inner>, channels: Vec<String>) -> SubscribeOutcome {
-        let (futures, batch): (Vec<String>, Vec<String>) = channels
-            .into_iter()
-            .partition(|c| c.starts_with("futures."));
-        let mut groups: Vec<Vec<String>> = vec![];
-        if !batch.is_empty() {
-            groups.push(batch.clone());
+    /// Subscribes `channels` in one request: the accepted ones come from the `subscribed` ack, the
+    /// refused ones (the channels missing from it) are paired with the error frames that came
+    /// before it, in order.
+    async fn subscribe_all(this: &Arc<Inner>, channels: Vec<String>) -> SubscribeOutcome {
+        match Inner::send_subscribe(this, channels).await {
+            Ok((added, rejected)) => SubscribeOutcome {
+                added,
+                rejected,
+                error: None,
+            },
+            Err(e) => SubscribeOutcome {
+                error: Some(e),
+                ..Default::default()
+            },
         }
-        groups.extend(futures.into_iter().map(|c| vec![c]));
-        let results = futures_util::future::join_all(
-            groups
-                .iter()
-                .map(|g| Inner::send_subscribe(this, g.clone())),
-        )
-        .await;
-        let mut out = SubscribeOutcome {
-            batch: batch.clone(),
-            ..Default::default()
-        };
-        for (group, r) in groups.into_iter().zip(results) {
-            let single_futures = group.len() == 1 && group[0].starts_with("futures.");
-            match r {
-                Ok(added) => out.added.extend(added),
-                Err(Error::WebSocket(w)) if w.from_server && single_futures => {
-                    out.rejected.push((group[0].clone(), w));
-                }
-                Err(e) => {
-                    if out.error.is_none() {
-                        out.error = Some(e);
-                    }
-                }
-            }
-        }
-        out
     }
 
-    /// The server refused to subscribe `channel` (sent alone): a private channel refused as
+    /// The automatic re-subscription (after a reconnect or a re-auth): a private channel refused
+    /// as `UNAUTHENTICATED` waits for the next successful auth; any other refusal drops the
+    /// channel. Each refusal is reported as [`WsEvent::Error`].
+    async fn resubscribe(this: &Arc<Inner>, channels: Vec<String>) {
+        let out = Inner::subscribe_all(this, channels).await;
+        for (c, w) in out.rejected {
+            this.refused(&c, &w);
+            this.emit_error(w.into());
+        }
+        if let Some(e) = out.error {
+            this.emit_error(e);
+        }
+    }
+
+    /// The server refused to re-subscribe `channel`: a private channel refused as
     /// `UNAUTHENTICATED` waits for the next successful auth; anything else is no longer held.
     fn refused(&self, channel: &str, err: &WsError) {
         let mut s = self.st.lock().unwrap();
@@ -1292,28 +1282,47 @@ impl Inner {
             let mut payload = Map::new();
             payload.insert("channels".into(), json!([c]));
             let unsub = Inner::request(&inner, "unsubscribe", payload, vec![c.clone()], false);
-            let sub = Inner::send_subscribe(&inner, vec![c.clone()]);
-            let (u, r) = futures_util::future::join(unsub, sub).await;
+            let sub = Inner::resubscribe(&inner, vec![c.clone()]);
+            let (u, ()) = futures_util::future::join(unsub, sub).await;
             if let Err(e) = u {
                 inner.emit_error(e);
-            }
-            match r {
-                Ok(_) => {}
-                Err(Error::WebSocket(w)) if w.from_server => {
-                    inner.refused(&c, &w);
-                    inner.emit_error(w.into());
-                }
-                Err(e) => inner.emit_error(e),
             }
         });
     }
 
-    async fn send_subscribe(this: &Arc<Inner>, channels: Vec<String>) -> Result<Vec<String>> {
+    /// The accepted channels and the refused ones with their errors.
+    async fn send_subscribe(
+        this: &Arc<Inner>,
+        channels: Vec<String>,
+    ) -> Result<(Vec<String>, Vec<(String, WsError)>)> {
         let mut payload = Map::new();
         payload.insert("channels".into(), json!(channels));
-        // `subscribed` is sent only when something was added: silence means nothing new.
-        let ack = Inner::request(this, "subscribe", payload, channels, false).await?;
-        Ok(string_list(ack.get("channels")))
+        // No ack and no error within ack_timeout: a TIMEOUT error (the caller keeps the channels,
+        // so a reconnect sends them again).
+        let (ack, errors) =
+            Inner::request_full(this, "subscribe", payload, channels.clone(), true).await?;
+        let added = string_list(ack.get("channels"));
+        let mut rejected = vec![];
+        if let Some(last) = errors.last() {
+            // The channels missing from the ack are the refused ones, paired with the errors in the
+            // order sent. The server normalises spot names (compared ignoring case), not futures
+            // coins (compared exactly). After its 100-subscription cap it stops with one error: the
+            // last error covers the rest.
+            let acked = |c: &String| {
+                added.iter().any(|a| {
+                    if c.starts_with("futures.") {
+                        a == c
+                    } else {
+                        a.eq_ignore_ascii_case(c)
+                    }
+                })
+            };
+            let missing = channels.into_iter().filter(|c| !acked(c));
+            for (i, c) in missing.enumerate() {
+                rejected.push((c, errors.get(i).unwrap_or(last).clone()));
+            }
+        }
+        Ok((added, rejected))
     }
 
     pub(crate) async fn unsubscribe(this: &Arc<Inner>, channels: Vec<String>) -> Result<()> {
@@ -1346,16 +1355,39 @@ impl Inner {
     async fn request(
         this: &Arc<Inner>,
         kind: &'static str,
-        mut payload: Map<String, Value>,
+        payload: Map<String, Value>,
         channels: Vec<String>,
         strict: bool,
     ) -> Result<Map<String, Value>> {
+        Inner::request_full(this, kind, payload, channels, strict)
+            .await
+            .map(|(m, _)| m)
+    }
+
+    /// [`Inner::request`], with the error frames a subscribe collected before its answer. A
+    /// subscribe that got error frames but no ack (on timeout or disconnect) answers with them:
+    /// every channel it got to was refused.
+    async fn request_full(
+        this: &Arc<Inner>,
+        kind: &'static str,
+        mut payload: Map<String, Value>,
+        channels: Vec<String>,
+        strict: bool,
+    ) -> Result<(Map<String, Value>, Vec<WsError>)> {
         let (tx, rx) = oneshot::channel();
         let id = {
             let mut s = this.st.lock().unwrap();
             let id = s.next_id.to_string();
             s.next_id += 1;
-            s.pending.insert(id.clone(), Pending { kind, channels, tx });
+            s.pending.insert(
+                id.clone(),
+                Pending {
+                    kind,
+                    channels,
+                    errors: vec![],
+                    tx,
+                },
+            );
             if kind == "auth_key" {
                 s.auth_key_ids.insert(id.clone());
             }
@@ -1368,13 +1400,22 @@ impl Inner {
             return Err(e.into());
         }
         match tokio::time::timeout(this.opts.ack_timeout, rx).await {
-            Ok(Ok(Ok(Value::Object(m)))) => Ok(m),
-            Ok(Ok(Ok(_))) => Ok(Map::new()),
+            Ok(Ok(Ok((Value::Object(m), errors)))) => Ok((m, errors)),
+            Ok(Ok(Ok((_, errors)))) => Ok((Map::new(), errors)),
             Ok(Ok(Err(e))) => Err(e.into()),
             Ok(Err(_)) => Err(WsError::local("DISCONNECTED", "connection lost").into()),
             Err(_) => {
-                this.st.lock().unwrap().pending.remove(&id);
-                if strict {
+                let errors = this
+                    .st
+                    .lock()
+                    .unwrap()
+                    .pending
+                    .remove(&id)
+                    .map(|p| p.errors)
+                    .unwrap_or_default();
+                if !errors.is_empty() {
+                    Ok((Map::new(), errors))
+                } else if strict {
                     let ack = match kind {
                         "auth" | "auth_key" => "authenticated",
                         "subscribe" => "subscribed",
@@ -1387,7 +1428,7 @@ impl Inner {
                     )
                     .into())
                 } else {
-                    Ok(Map::new())
+                    Ok((Map::new(), vec![]))
                 }
             }
         }
@@ -1434,8 +1475,9 @@ impl Inner {
                 _ => None,
             }
         };
-        if let Some(p) = p {
-            let _ = p.tx.send(result);
+        if let Some(mut p) = p {
+            let errors = std::mem::take(&mut p.errors);
+            let _ = p.tx.send(result.map(|v| (v, errors)));
         }
     }
 
@@ -1449,8 +1491,9 @@ impl Inner {
                 .map(|(id, _)| id.clone());
             id.and_then(|id| s.pending.remove(&id))
         };
-        if let Some(p) = p {
-            let _ = p.tx.send(Ok(frame));
+        if let Some(mut p) = p {
+            let errors = std::mem::take(&mut p.errors);
+            let _ = p.tx.send(Ok((frame, errors)));
         }
     }
 
@@ -1595,7 +1638,27 @@ impl Inner {
                     if matches!(kind, Some("auth" | "auth_key")) {
                         this.signed_out(AuthChangeReason::AuthFailed, Some(code.to_string()));
                     }
-                    this.settle(id, None, Err(err.clone()));
+                    // A subscribe gets one error per refused channel before its ack: it completes
+                    // on the ack, or here once every channel was refused (no ack follows then).
+                    let wait_ack = {
+                        let mut s = this.st.lock().unwrap();
+                        match s.pending.get_mut(id) {
+                            Some(p) if p.kind == "subscribe" => {
+                                p.errors.push(err.clone());
+                                if p.errors.len() >= p.channels.len()
+                                    && let Some(mut p) = s.pending.remove(id)
+                                {
+                                    let errors = std::mem::take(&mut p.errors);
+                                    let _ = p.tx.send(Ok((Value::Null, errors)));
+                                }
+                                true
+                            }
+                            _ => false,
+                        }
+                    };
+                    if !wait_ack {
+                        this.settle(id, None, Err(err.clone()));
+                    }
                 }
                 this.emit(WsEvent::ServerError(err));
                 if code == ErrorCode::ConcurrentModification.as_str() && id.is_none() {
@@ -1865,28 +1928,8 @@ impl Inner {
         let inner = this.clone();
         let sent = channels.clone();
         tokio::spawn(async move {
-            let out = Inner::subscribe_split(&inner, sent).await;
-            for (c, w) in out.rejected {
-                inner.refused(&c, &w);
-                inner.emit_error(w.into());
-            }
-            if let Some(e) = out.error {
-                if let Error::WebSocket(w) = &e
-                    && w.from_server
-                {
-                    // Refused by the server (e.g. signed out again meanwhile): back to pending.
-                    let mut s = inner.st.lock().unwrap();
-                    for c in &out.batch {
-                        if let Some(i) = s.channels.iter().position(|x| x == c) {
-                            s.channels.remove(i);
-                            if !s.pending_private.contains(c) {
-                                s.pending_private.push(c.clone());
-                            }
-                        }
-                    }
-                }
-                inner.emit_error(e);
-            }
+            // UNAUTHENTICATED (signed out again meanwhile): back to pending; other refusals drop.
+            Inner::resubscribe(&inner, sent).await;
         });
         this.emit(WsEvent::Resync(ResyncReason::Reauth));
     }
@@ -1973,7 +2016,13 @@ impl Inner {
         s.out = None;
         s.welcome = None;
         for (_, p) in s.pending.drain() {
-            let _ = p.tx.send(Err(err.clone()));
+            // A subscribe that got refusals but no ack: those refusals are its answer.
+            let reply = if p.errors.is_empty() {
+                Err(err.clone())
+            } else {
+                Ok((Value::Null, p.errors))
+            };
+            let _ = p.tx.send(reply);
         }
     }
 

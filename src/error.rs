@@ -89,8 +89,8 @@ pub enum Error {
         retries: u32,
     },
 
-    /// An iterate-all helper got a page WITH rows whose `next_cursor` was a cursor it had already
-    /// sent: following it would repeat rows forever. The rows of that page were yielded, then
+    /// An iterate-all helper got a page WITH rows whose `next_cursor` was the cursor it had just
+    /// sent: following it would repeat that page forever. The rows of that page were yielded, then
     /// this. Code [`PAGING_CURSOR_REPEATED`], a local error; not retryable. The rows yielded
     /// before it are NOT the complete history.
     #[error(

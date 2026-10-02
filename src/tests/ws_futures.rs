@@ -190,18 +190,24 @@ async fn futures_channel_names() {
 }
 
 #[test]
-fn ping_interval_is_at_most_60_seconds() {
+fn ping_interval_above_60_seconds_is_a_config_error() {
     let max = load("ws/futures.json")
         .and_then(|s| s["ping_interval_max_seconds"].as_u64())
         .unwrap_or(60);
     assert!(MAX_PING_INTERVAL <= Duration::from_secs(max));
     assert!(WsOptions::default().ping_interval <= MAX_PING_INTERVAL);
-    let ws = WebSocket::new(WsOptions {
-        ping_interval: Duration::from_secs(120),
-        ..Default::default()
-    })
-    .unwrap();
-    assert_eq!(ws.inner.opts.ping_interval, MAX_PING_INTERVAL);
+    let build = |secs| {
+        WebSocket::new(WsOptions {
+            ping_interval: Duration::from_secs(secs),
+            ..Default::default()
+        })
+    };
+    let e = build(61).unwrap_err();
+    assert!(matches!(e, Error::Config(_)), "{e}");
+    assert_eq!(
+        build(60).unwrap().inner.opts.ping_interval,
+        MAX_PING_INTERVAL
+    );
 }
 
 /// The request of `op` most recently sent and not yet answered.
@@ -342,47 +348,96 @@ async fn run_scenario(sc: Value) {
     ws.close().await;
 }
 
-/// The server sends a refusal as an error frame with the request id and no channel name, before
-/// the request's single `subscribed` ack (and no ack when nothing was accepted): each futures
-/// channel goes in a request of its own, so the refusal is attributed to the right channel.
+fn subscribe_task(
+    ws: &WebSocket,
+    channels: &[&str],
+) -> tokio::task::JoinHandle<crate::Result<crate::SubscribeResult>> {
+    let ws2 = ws.clone();
+    let owned: Vec<String> = channels.iter().map(|c| c.to_string()).collect();
+    tokio::spawn(async move {
+        let refs: Vec<&str> = owned.iter().map(String::as_str).collect();
+        ws2.subscribe(&refs).await
+    })
+}
+
+fn refusal(code: &str, id: &Value) -> Value {
+    json!({"type": "error", "code": code, "message": code.to_lowercase(), "id": id})
+}
+
+/// The server answers a subscribe with one error frame per refused channel (with the request id,
+/// not naming the channel) BEFORE its single `subscribed` ack, and sends no ack when it refused
+/// every channel. Spot and futures alike; the channels stay in one frame.
 #[tokio::test]
-async fn a_partly_refused_subscribe_keeps_the_accepted_channels() {
+async fn subscribe_refusals_are_collected_until_the_ack() {
     let mut srv = Server::start_with(welcome()).await;
     let (ws, mut rx, mut conn) = connected(&mut srv).await;
-    let ws2 = ws.clone();
-    let t = tokio::spawn(async move {
-        ws2.subscribe(&["ticker:BTC/USDT", "futures.mids", "futures.trades:BTC"])
-            .await
-    });
-    let batch = conn.recv().await;
-    let mids = conn.recv().await;
-    let trades = conn.recv().await;
-    assert_eq!(batch["channels"], json!(["ticker:BTC/USDT"]));
-    assert_eq!(mids["channels"], json!(["futures.mids"]));
-    assert_eq!(trades["channels"], json!(["futures.trades:BTC"]));
-    conn.send(json!({"type": "error", "code": "RATE_LIMITED", "message": "Too many new futures market subscriptions. Please retry shortly.", "id": trades["id"]}));
-    conn.send(json!({"type": "subscribed", "channels": ["ticker:BTC/USDT"], "id": batch["id"]}));
-    conn.send(json!({"type": "subscribed", "channels": ["futures.mids"], "id": mids["id"]}));
+
+    // Partly refused: accepted ones held, refused ones reported and not held.
+    let t = subscribe_task(
+        &ws,
+        &[
+            "ticker:BTC/USDT",
+            "trades:NOPE/USDT",
+            "futures.mids",
+            "futures.trades:BTC",
+        ],
+    );
+    let req = conn.recv().await;
+    assert_eq!(
+        req["channels"],
+        json!([
+            "ticker:BTC/USDT",
+            "trades:NOPE/USDT",
+            "futures.mids",
+            "futures.trades:BTC"
+        ])
+    );
+    conn.send(refusal("NOT_FOUND", &req["id"]));
+    conn.send(refusal("RATE_LIMITED", &req["id"]));
+    conn.send(json!({"type": "subscribed", "channels": ["ticker:BTC/USDT", "futures.mids"], "id": req["id"]}));
     let r = t.await.unwrap().unwrap();
     assert_eq!(r.added, ["ticker:BTC/USDT", "futures.mids"]);
-    assert_eq!(r.rejected.len(), 1);
+    let rejected: Vec<(&str, &str)> = r
+        .rejected
+        .iter()
+        .map(|(c, e)| (c.as_str(), e.code.as_str()))
+        .collect();
     assert_eq!(
-        (r.rejected[0].0.as_str(), r.rejected[0].1.code.as_str()),
-        ("futures.trades:BTC", "RATE_LIMITED")
+        rejected,
+        [
+            ("trades:NOPE/USDT", "NOT_FOUND"),
+            ("futures.trades:BTC", "RATE_LIMITED")
+        ]
     );
     assert_eq!(ws.channels(), ["ticker:BTC/USDT", "futures.mids"]);
 
-    // Every channel refused: an error, nothing held, nothing resent.
-    let ws2 = ws.clone();
-    let t = tokio::spawn(async move { ws2.subscribe(&["futures.orderbook:XYZ"]).await });
+    // Every channel refused: complete at the last error (no ack follows), an error, nothing held.
+    let t = subscribe_task(&ws, &["futures.orderbook:XYZ", "ticker:NOPE/USDT"]);
     let req = conn.recv().await;
-    conn.send(json!({"type": "error", "code": "NOT_FOUND", "message": "Futures market not found", "id": req["id"]}));
-    let e = t.await.unwrap().unwrap_err();
+    conn.send(refusal("NOT_FOUND", &req["id"]));
+    conn.send(refusal("NOT_FOUND", &req["id"]));
+    let e = tokio::time::timeout(Duration::from_millis(300), t)
+        .await
+        .expect("done at the last refusal, before ack_timeout")
+        .unwrap()
+        .unwrap_err();
     assert!(
         matches!(&e, Error::WebSocket(w) if w.code == "NOT_FOUND" && w.from_server),
         "{e}"
     );
+
+    // No ack within ack_timeout after at least one error: all refused.
+    let t = subscribe_task(&ws, &["trades:A/B", "trades:C/D"]);
+    let req = conn.recv().await;
+    conn.send(refusal("VALIDATION_FAILED", &req["id"]));
+    let e = t.await.unwrap().unwrap_err();
+    assert!(
+        matches!(&e, Error::WebSocket(w) if w.code == "VALIDATION_FAILED"),
+        "{e}"
+    );
     assert_eq!(ws.channels(), ["ticker:BTC/USDT", "futures.mids"]);
+
+    // Nothing is resent; every refusal was reported as a server error.
     assert!(settle(&ws, &mut conn).await.is_empty());
     let mut refusals = 0;
     while let Ok(ev) = rx.try_recv() {
@@ -390,7 +445,138 @@ async fn a_partly_refused_subscribe_keeps_the_accepted_channels() {
             refusals += 1;
         }
     }
-    assert_eq!(refusals, 2);
+    assert_eq!(refusals, 5);
+
+    // Spot names come back normalised: compared ignoring case. Futures coins exactly.
+    let t = subscribe_task(&ws, &["ticker:eth/usdt", "futures.trades:btc"]);
+    let req = conn.recv().await;
+    conn.send(refusal("NOT_FOUND", &req["id"]));
+    conn.send(json!({"type": "subscribed", "channels": ["ticker:ETH/USDT"], "id": req["id"]}));
+    let r = t.await.unwrap().unwrap();
+    assert_eq!(r.added, ["ticker:ETH/USDT"]);
+    assert_eq!(r.rejected.len(), 1);
+    assert_eq!(r.rejected[0].0, "futures.trades:btc");
+
+    // Fewer errors than missing channels (the server's subscription cap stops the frame): the last
+    // error covers the rest.
+    let t = subscribe_task(&ws, &["ticker:A/B", "ticker:C/D", "ticker:E/F"]);
+    let req = conn.recv().await;
+    conn.send(refusal("RATE_LIMITED", &req["id"]));
+    conn.send(json!({"type": "subscribed", "channels": ["ticker:A/B"], "id": req["id"]}));
+    let r = t.await.unwrap().unwrap();
+    let rejected: Vec<(&str, &str)> = r
+        .rejected
+        .iter()
+        .map(|(c, e)| (c.as_str(), e.code.as_str()))
+        .collect();
+    assert_eq!(
+        rejected,
+        [
+            ("ticker:C/D", "RATE_LIMITED"),
+            ("ticker:E/F", "RATE_LIMITED")
+        ]
+    );
+
+    // No ack and no error within ack_timeout: TIMEOUT, and the channel stays held (a reconnect
+    // sends it again).
+    let t = subscribe_task(&ws, &["ticker:ETH/BTC"]);
+    conn.recv().await;
+    let e = t.await.unwrap().unwrap_err();
+    assert!(
+        matches!(&e, Error::WebSocket(w) if w.code == "TIMEOUT" && !w.from_server),
+        "{e}"
+    );
+    assert!(ws.channels().contains(&"ticker:ETH/BTC".to_string()));
+    ws.close().await;
+}
+
+/// After a reconnect, a private channel refused as UNAUTHENTICATED waits for the next auth; any
+/// other refusal drops the channel and is reported. Spot and futures alike.
+#[tokio::test]
+async fn resubscribe_after_reconnect_sorts_refusals() {
+    let mut srv = Server::start_with(welcome()).await;
+    let ws = WebSocket::new(options(&srv.url)).unwrap();
+    let mut rx = ws.events().unwrap();
+    ws.connect().await.unwrap();
+    let mut c1 = srv.conn().await;
+    let ws2 = ws.clone();
+    let t = tokio::spawn(async move { ws2.auth("tok").await });
+    let req = c1.recv().await;
+    c1.send(json!({"type": "authenticated", "user_id": "u1", "id": req["id"]}));
+    t.await.unwrap().unwrap();
+    let t = subscribe_task(&ws, &["orders", "futures.mids", "ticker:BTC/USDT"]);
+    let req = c1.recv().await;
+    c1.send(json!({"type": "subscribed", "channels": req["channels"], "id": req["id"]}));
+    t.await.unwrap().unwrap();
+
+    c1.close();
+    let mut c2 = srv.conn().await;
+    let auth = c2.recv().await;
+    assert_eq!(auth["op"], "auth");
+    c2.send(json!({"type": "authenticated", "user_id": "u1", "id": auth["id"]}));
+    let sub = c2.recv().await;
+    assert_eq!(
+        sub["channels"],
+        json!(["orders", "futures.mids", "ticker:BTC/USDT"])
+    );
+    c2.send(refusal("UNAUTHENTICATED", &sub["id"]));
+    c2.send(refusal("SERVICE_UNAVAILABLE", &sub["id"]));
+    c2.send(json!({"type": "subscribed", "channels": ["ticker:BTC/USDT"], "id": sub["id"]}));
+    assert!(settle(&ws, &mut c2).await.is_empty(), "no automatic retry");
+    assert_eq!(ws.channels(), ["ticker:BTC/USDT"]);
+    assert_eq!(ws.pending_channels(), ["orders"]);
+    let mut reported = vec![];
+    while let Ok(ev) = rx.try_recv() {
+        if let WsEvent::Error(Error::WebSocket(w)) = ev {
+            reported.push(w.code);
+        }
+    }
+    assert_eq!(reported, ["UNAUTHENTICATED", "SERVICE_UNAVAILABLE"]);
+    ws.close().await;
+}
+
+/// After a re-auth, the pending private channels are re-subscribed: a refusal other than
+/// UNAUTHENTICATED drops the channel (not pending any more).
+#[tokio::test]
+async fn resubscribe_after_reauth_drops_a_refused_channel() {
+    let mut srv = Server::start_with(welcome()).await;
+    let (ws, mut rx, mut conn) = connected(&mut srv).await;
+    let ws2 = ws.clone();
+    let t = tokio::spawn(async move { ws2.auth_key().await });
+    let req = conn.recv().await;
+    conn.send(
+        json!({"type": "authenticated", "user_id": "u1", "challenge": "ch-2", "id": req["id"]}),
+    );
+    t.await.unwrap().unwrap();
+    let t = subscribe_task(&ws, &["orders", "futures.account"]);
+    let req = conn.recv().await;
+    conn.send(json!({"type": "subscribed", "channels": req["channels"], "id": req["id"]}));
+    t.await.unwrap().unwrap();
+
+    conn.send(json!({"type": "signed_out", "reason": "expired"}));
+    settle(&ws, &mut conn).await;
+    assert_eq!(ws.pending_channels(), ["orders", "futures.account"]);
+    let ws2 = ws.clone();
+    let t = tokio::spawn(async move { ws2.auth_key().await });
+    let req = conn.recv().await;
+    conn.send(
+        json!({"type": "authenticated", "user_id": "u1", "challenge": "ch-3", "id": req["id"]}),
+    );
+    t.await.unwrap().unwrap();
+    let sub = conn.recv().await;
+    assert_eq!(sub["channels"], json!(["orders", "futures.account"]));
+    conn.send(refusal("NOT_FOUND", &sub["id"]));
+    conn.send(json!({"type": "subscribed", "channels": ["orders"], "id": sub["id"]}));
+    assert!(settle(&ws, &mut conn).await.is_empty());
+    assert_eq!(ws.channels(), ["orders"]);
+    assert!(ws.pending_channels().is_empty());
+    let reported: Vec<String> = std::iter::from_fn(|| rx.try_recv().ok())
+        .filter_map(|ev| match ev {
+            WsEvent::Error(Error::WebSocket(w)) => Some(w.code),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(reported, ["NOT_FOUND"]);
     ws.close().await;
 }
 

@@ -23,8 +23,8 @@ All notable changes to this project are documented here. The format follows
   query), short and empty pages are followed until `next_cursor` is null, an empty page that repeats
   the cursor just sent (the provider is busy) is retried with the same cursor after the retry backoff
   at most `max_busy_retries` times (`DEFAULT_MAX_BUSY_RETRIES`, 3; `Futures::with_max_busy_retries`
-  changes it, independently of the client's `max_retries`), a page with rows that repeats a cursor
-  already sent yields its rows and then stops, and `has_account: false` yields nothing.
+  changes it, independently of the client's `max_retries`), a page with rows whose `next_cursor` is
+  the cursor just sent (the spec's rule) yields its rows and then stops, and `has_account: false` yields nothing.
 - Local paging errors that end those streams; the rows before them are not the whole history, and
   both carry the cursor: `Error::PagingStalled` (code `PAGING_STALLED`, retryable: the provider stayed
   busy) and `Error::PagingCursorRepeated` (code `PAGING_CURSOR_REPEATED`, not retryable: the server
@@ -47,19 +47,33 @@ All notable changes to this project are documented here. The format follows
   REST. On `futures.account` the client also sends `unsubscribe` then `subscribe` for it (the server's
   updates stopped and a repeated subscribe alone does nothing); a refusal of that subscribe drops the
   channel and is reported as `WsEvent::Error`.
-- Each `futures.*` channel is subscribed in a request of its own, because the server answers a
-  partly refused subscribe with error frames that do not name the channel, before the one
-  `subscribed` ack (and sends no ack when nothing was accepted). Refusals are in the new
-  `SubscribeResult::rejected` (the call fails when every channel sent was refused); they are not held
-  and not retried automatically (WebSocket errors carry no retry hint). The same applies to the
-  automatic re-subscription after a reconnect or a re-auth.
-- `MAX_PING_INTERVAL` (60 s): a longer `WsOptions::ping_interval` is lowered to it, since the server
-  closes connections whose client is silent for 90 to 120 s.
+- `SubscribeResult::rejected`: the channels the server refused, each with its error (see Fixed).
+- `MAX_PING_INTERVAL` (60 s): a longer `WsOptions::ping_interval` is an `Error::Config` when the
+  WebSocket is built, since the server closes connections whose client is silent for 90 to 120 s.
 
 ### Changed
 - `PRIVATE_CHANNELS` is now `[&str; 6]` and `SubscribeResult` has two new public fields (`rejected`,
   `pending`): code that names the array type or builds `SubscribeResult` with a full struct literal
   must be updated.
+- `subscribe` with neither an ack nor an error within `ack_timeout` now fails with a local `TIMEOUT`
+  error (it used to succeed with nothing added). The channels stay held, so a reconnect sends them
+  again.
+
+### Fixed
+- A partly refused subscribe (spot or futures). The server answers it with one error frame per
+  refused channel, carrying the request id but not the channel, BEFORE its single `subscribed` ack,
+  and sends no ack when it refused every channel. The client failed the whole request on the first
+  error frame and stopped holding every channel in it. It now collects the error frames: the request
+  completes on the ack, or once every channel was refused, or at `ack_timeout` (with at least one
+  error: all refused). `subscribe` returns the accepted channels in `added` and the refused ones,
+  paired with the errors in the order sent (spot names compared ignoring case, as the server
+  normalises them; futures names exactly; when there are fewer errors than refused channels, after
+  the server's 100-subscription stop, the last error covers the rest), in `rejected`; it fails only when every channel sent was
+  refused (or on a disconnect). Refused channels are not held and not retried. A subscribe is still
+  one frame.
+- The automatic re-subscription after a reconnect or a re-auth sorts refusals the same way: a
+  private channel refused as `UNAUTHENTICATED` waits for the next successful auth; any other refusal
+  drops the channel and is reported as `WsEvent::Error`.
 
 ## [0.1.0-dev.8] (2026-10-01)
 

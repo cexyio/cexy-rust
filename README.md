@@ -250,7 +250,7 @@ println!("{} open orders, {} fills", orders.orders.len(), fills.len());
   it is `None`. `all_fills` / `all_funding` do this for you. When the provider is busy (an empty page
   whose `next_cursor` is the cursor just sent), they wait with the retry backoff and ask again, at most
   3 times (`with_max_busy_retries` changes it; the client's `max_retries` does not), then end with
-  `Error::PagingStalled` (code `PAGING_STALLED`, retryable). A page with rows that repeats a cursor
+  `Error::PagingStalled` (code `PAGING_STALLED`, retryable). A page with rows that repeats the cursor just sent
   ends them with `Error::PagingCursorRepeated` (not retryable). Either way, the rows before the error
   are not the whole history.
 
@@ -295,14 +295,21 @@ counted in `ws.dropped_events()`. Live order books keep updating either way (`bo
 
 What the client does for you:
 
-- Sends `{"op":"ping"}` every 30 s, never less often than every 60 s (required: the server closes
-  connections whose client is silent for 90 s) and accepts the server's
+- Sends `{"op":"ping"}` every 30 s (`ping_interval`; above 60 s is a configuration error: the server
+  closes connections whose client is silent for 90 s) and accepts the server's
   unsolicited pongs. No frame from the server for 75 s (`liveness_timeout`; the client's own pings do not
   count) means a dead connection and a reconnect.
 - Reconnects with exponential backoff and full jitter, then re-authenticates and re-subscribes everything.
 - Correlates every request with its acknowledgement by `id`: `auth` returns on `authenticated`
   (and fails on an `error` with its id, or on timeout), `subscribe` on `subscribed`, `unsubscribe` on
   `unsubscribed`, `ping` on `pong`.
+- Collects a subscribe's refusals: the server sends one `error` frame (with the request id) per refused
+  channel before its `subscribed` ack, and no ack when it refused them all. `subscribe` returns the
+  accepted channels in `added` and the refused ones with their errors in `rejected`, and fails only
+  when every channel sent was refused (no answer at all within `ack_timeout` is a `TIMEOUT` error; those
+  channels stay held). Refused channels are not held and not retried. When the
+  automatic re-subscription after a reconnect or re-auth is refused, a private channel refused as
+  `UNAUTHENTICATED` waits for the next auth; any other refusal drops it (reported as `WsEvent::Error`).
 - Guards locally: at most 100 subscriptions (extras are returned in `refused`) and 200 messages a minute.
 - Warns once (`WsEvent::Warning`) if the server speaks another `protocol_version`, and ignores unknown event types.
 
@@ -398,9 +405,8 @@ while let Some(ev) = events.recv().await {
 - `futures.account` subscribed before `auth`/`auth_key` succeeds is held (`SubscribeResult::pending`,
   `ws.pending_channels()`) and subscribed once it does; a sign-out ends it like the other private
   channels.
-- Each `futures.*` channel is subscribed in a request of its own, so a refusal (`RATE_LIMITED`,
-  `NOT_FOUND`, `VALIDATION_FAILED`, `SERVICE_UNAVAILABLE`) names its channel. Refused channels are in
-  `SubscribeResult::rejected` (an error when every channel sent was refused), are not held and are
+- A refused futures subscribe (`RATE_LIMITED`, `NOT_FOUND`, `VALIDATION_FAILED`,
+  `SERVICE_UNAVAILABLE`) is in `SubscribeResult::rejected` like any refused channel (below), and is
   not retried: WebSocket error frames carry no retry hint, so back off yourself (about 60 s after
   `RATE_LIMITED`).
 - Public futures sequences are not gap-checked (frames are full replacements, or lost for trades and
