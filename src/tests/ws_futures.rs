@@ -467,7 +467,9 @@ async fn subscribe_refusals_are_collected_until_the_ack() {
     let r = t.await.unwrap().unwrap();
     let rejected: Vec<&str> = r.rejected.iter().map(|(c, _)| c.as_str()).collect();
     assert_eq!(rejected, ["ticker:nope_usdt"]);
-    assert!(ws.channels().contains(&"ticker:sol_usdt".to_string()));
+    // Held under the canonical name from the ack (spec rule 13).
+    assert!(ws.channels().contains(&"ticker:SOL/USDT".to_string()));
+    assert!(!ws.channels().contains(&"ticker:sol_usdt".to_string()));
 
     // Another spelling of a held channel is already held: nothing is sent.
     let r = ws.subscribe(&["ticker:btc_usdt"]).await.unwrap();
@@ -523,6 +525,48 @@ async fn subscribe_refusals_are_collected_until_the_ack() {
         "{e}"
     );
     assert!(ws.channels().contains(&"ticker:ETH/BTC".to_string()));
+    ws.close().await;
+}
+
+/// Spec rule 13: an accepted channel is held, and re-sent after a reconnect, under the server's
+/// canonical name from the ack; any spelling unsubscribes it.
+#[tokio::test]
+async fn accepted_channels_are_held_under_the_canonical_name() {
+    let mut srv = Server::start_with(welcome()).await;
+    let ws = WebSocket::new(options(&srv.url)).unwrap();
+    ws.connect().await.unwrap();
+    let mut c1 = srv.conn().await;
+    let t = subscribe_task(&ws, &["ticker:eth_usdt", "trades:sol_usdt"]);
+    let req = c1.recv().await;
+    assert_eq!(
+        req["channels"],
+        json!(["ticker:eth_usdt", "trades:sol_usdt"])
+    );
+    c1.send(json!({"type": "subscribed", "channels": ["ticker:ETH/USDT", "trades:SOL/USDT"], "id": req["id"]}));
+    let r = t.await.unwrap().unwrap();
+    assert_eq!(r.added, ["ticker:ETH/USDT", "trades:SOL/USDT"]);
+    assert_eq!(ws.channels(), ["ticker:ETH/USDT", "trades:SOL/USDT"]);
+
+    c1.close();
+    let mut c2 = srv.conn().await;
+    let sub = c2.recv().await;
+    assert_eq!(sub["op"], "subscribe");
+    assert_eq!(
+        sub["channels"],
+        json!(["ticker:ETH/USDT", "trades:SOL/USDT"])
+    );
+    c2.send(json!({"type": "subscribed", "channels": sub["channels"], "id": sub["id"]}));
+    assert!(settle(&ws, &mut c2).await.is_empty());
+
+    // Unsubscribing by the user's spelling sends the held (canonical) name.
+    let ws2 = ws.clone();
+    let t = tokio::spawn(async move { ws2.unsubscribe(&["trades:sol_usdt"]).await });
+    let req = c2.recv().await;
+    assert_eq!(req["op"], "unsubscribe");
+    assert_eq!(req["channels"], json!(["trades:SOL/USDT"]));
+    c2.send(json!({"type": "unsubscribed", "channels": ["trades:SOL/USDT"], "id": req["id"]}));
+    t.await.unwrap().unwrap();
+    assert_eq!(ws.channels(), ["ticker:ETH/USDT"]);
     ws.close().await;
 }
 
@@ -733,14 +777,9 @@ async fn subscribe_refusals_conformance() {
                 None => &case["expect"],
             };
             let result = task.await.unwrap();
-            // Held under any spelling the server canonicalises alike.
+            // Held under the server's canonical name from the ack (rule 13).
             for c in strings(&expect["held_after"]) {
-                assert!(
-                    ws.channels()
-                        .iter()
-                        .any(|h| channel_key(h) == channel_key(&c)),
-                    "{at}: {c} held"
-                );
+                assert!(ws.channels().contains(&c), "{at}: {c} held");
             }
             if let Some(code) = expect["error_code"].as_str() {
                 let e = result.unwrap_err();

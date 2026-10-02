@@ -80,6 +80,10 @@ All notable changes to this project are documented here. The format follows
   canonicalised (trimmed, uppercased, `_` as `/`), and the whole name is trimmed. Ack names are
   matched as a multiset (the ack can repeat a name). `subscribe` sends two spellings of one channel
   once, and reports a channel already held under another spelling in `already_subscribed`.
+- An accepted channel is now held, and re-sent after a reconnect, under the server's canonical name
+  from the ack (spec 6cea8f0, rule 13): `ticker:btc_usdt` is held as `ticker:BTC/USDT`, so held
+  names match event channels. `unsubscribe` takes any spelling of a held channel and sends the held
+  name.
 
 ## [0.1.0-dev.8] (2026-10-01)
 

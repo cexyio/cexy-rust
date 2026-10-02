@@ -547,7 +547,12 @@ pub(crate) struct State {
 impl State {
     /// Whether `c` is held, or pending re-subscription after a sign-out.
     pub(crate) fn holds(&self, c: &str) -> bool {
-        self.channels.iter().any(|x| x == c) || self.pending_private.iter().any(|x| x == c)
+        // Under any spelling the server canonicalises alike (held names are the canonical ones).
+        let k = channel_key(c);
+        self.channels
+            .iter()
+            .chain(&self.pending_private)
+            .any(|x| channel_key(x) == k)
     }
 }
 
@@ -713,7 +718,8 @@ impl WebSocket {
         s.out.is_some() && s.welcome.is_some()
     }
 
-    /// The channels currently held (restored after every reconnect).
+    /// The channels currently held (restored after every reconnect), each under the server's
+    /// canonical name from its ack (`ticker:btc_usdt` is held as `ticker:BTC/USDT`).
     pub fn channels(&self) -> Vec<String> {
         self.inner.st.lock().unwrap().channels.clone()
     }
@@ -1244,11 +1250,14 @@ impl Inner {
     /// before it, in order.
     async fn subscribe_all(this: &Arc<Inner>, channels: Vec<String>) -> SubscribeOutcome {
         match Inner::send_subscribe(this, channels).await {
-            Ok((added, rejected)) => SubscribeOutcome {
-                added,
-                rejected,
-                error: None,
-            },
+            Ok((added, renamed, rejected)) => {
+                this.hold_canonical(&renamed);
+                SubscribeOutcome {
+                    added,
+                    rejected,
+                    error: None,
+                }
+            }
             Err(e) => SubscribeOutcome {
                 error: Some(e),
                 ..Default::default()
@@ -1303,10 +1312,32 @@ impl Inner {
     }
 
     /// The accepted channels and the refused ones with their errors.
+    /// Accepted channels are held under the server's canonical name from the ack (spec rule 13),
+    /// so held names match event channels and a reconnect re-sends that name.
+    fn hold_canonical(&self, renamed: &[(String, String)]) {
+        let mut s = self.st.lock().unwrap();
+        for (sent, canonical) in renamed {
+            if sent == canonical {
+                continue;
+            }
+            let Some(i) = s.channels.iter().position(|x| x == sent) else {
+                continue;
+            };
+            if s.channels.contains(canonical) {
+                s.channels.remove(i);
+            } else {
+                s.channels[i] = canonical.clone();
+            }
+        }
+    }
+
+    /// The accepted channels (the ack's names), each accepted channel as (name sent, canonical
+    /// name acked), and the refused ones with their errors.
+    #[allow(clippy::type_complexity)]
     async fn send_subscribe(
         this: &Arc<Inner>,
         channels: Vec<String>,
-    ) -> Result<(Vec<String>, Vec<(String, WsError)>)> {
+    ) -> Result<(Vec<String>, Vec<(String, String)>, Vec<(String, WsError)>)> {
         let mut payload = Map::new();
         payload.insert("channels".into(), json!(channels));
         // No ack and no error within ack_timeout: a TIMEOUT error (the caller keeps the channels,
@@ -1314,29 +1345,29 @@ impl Inner {
         let (ack, errors) =
             Inner::request_full(this, "subscribe", payload, channels.clone(), true).await?;
         let added = string_list(ack.get("channels"));
+        // Ack names are matched as a multiset (the ack can repeat a name) with the server's
+        // canonicalisation (see `channel_key`: kinds and futures names exactly, spot markets
+        // uppercased with `_` as `/`).
+        let mut pool: Vec<(String, &String)> = added.iter().map(|a| (channel_key(a), a)).collect();
+        let mut renamed = vec![];
+        let mut missing = vec![];
+        for c in channels {
+            let k = channel_key(&c);
+            match pool.iter().position(|(a, _)| *a == k) {
+                Some(i) => renamed.push((c, pool.swap_remove(i).1.clone())),
+                None => missing.push(c),
+            }
+        }
         let mut rejected = vec![];
         if let Some(last) = errors.last() {
             // The channels missing from the ack are the refused ones, paired with the errors in the
-            // order sent. Ack names are matched as a multiset (the ack can repeat a name) with the
-            // server's canonicalisation (see `channel_key`: kinds and futures names exactly, spot
-            // markets uppercased with `_` as `/`). After its 100-subscription cap it stops with
-            // one error: the last error covers the rest.
-            let mut pool: Vec<String> = added.iter().map(|a| channel_key(a)).collect();
-            let missing = channels.into_iter().filter(|c| {
-                let k = channel_key(c);
-                match pool.iter().position(|a| *a == k) {
-                    Some(i) => {
-                        pool.swap_remove(i);
-                        false
-                    }
-                    None => true,
-                }
-            });
-            for (i, c) in missing.enumerate() {
+            // order sent. After its 100-subscription cap the server stops with one error: the
+            // last error covers the rest.
+            for (i, c) in missing.into_iter().enumerate() {
                 rejected.push((c, errors.get(i).unwrap_or(last).clone()));
             }
         }
-        Ok((uniq(added), rejected))
+        Ok((uniq(added), renamed, rejected))
     }
 
     pub(crate) async fn unsubscribe(this: &Arc<Inner>, channels: Vec<String>) -> Result<()> {
@@ -1344,11 +1375,17 @@ impl Inner {
             let mut s = this.st.lock().unwrap();
             let mut held = vec![];
             for c in uniq(channels) {
-                s.pending_private.retain(|x| x != &c);
-                Inner::reset_seq(&mut s, Some(&c));
-                if let Some(i) = s.channels.iter().position(|x| x == &c) {
-                    s.channels.remove(i);
-                    held.push(c);
+                // Any spelling of a held channel (held under the server's canonical name).
+                let k = channel_key(&c);
+                s.pending_private.retain(|x| channel_key(x) != k);
+                if let Some(i) = s.channels.iter().position(|x| channel_key(x) == k) {
+                    let name = s.channels.remove(i);
+                    Inner::reset_seq(&mut s, Some(&name));
+                    if !held.contains(&name) {
+                        held.push(name);
+                    }
+                } else {
+                    Inner::reset_seq(&mut s, Some(&c));
                 }
             }
             (held, s.out.is_some() && s.welcome.is_some())
@@ -1501,7 +1538,12 @@ impl Inner {
             let id = s
                 .pending
                 .iter()
-                .find(|(_, p)| p.kind == kind && p.channels.iter().any(|c| channels.contains(c)))
+                .find(|(_, p)| {
+                    p.kind == kind
+                        && p.channels
+                            .iter()
+                            .any(|c| channels.iter().any(|a| channel_key(a) == channel_key(c)))
+                })
                 .map(|(id, _)| id.clone());
             id.and_then(|id| s.pending.remove(&id))
         };
