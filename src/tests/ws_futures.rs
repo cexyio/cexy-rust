@@ -457,6 +457,17 @@ async fn subscribe_refusals_are_collected_until_the_ack() {
     assert_eq!(r.rejected.len(), 1);
     assert_eq!(r.rejected[0].0, "futures.trades:btc");
 
+    // The server rewrites `_` to `/` in a spot market: `ticker:btc_usdt` is acked as
+    // `ticker:BTC/USDT`, so only the other channel was refused.
+    let t = subscribe_task(&ws, &["ticker:btc_usdt", "ticker:nope_usdt"]);
+    let req = conn.recv().await;
+    conn.send(refusal("NOT_FOUND", &req["id"]));
+    conn.send(json!({"type": "subscribed", "channels": ["ticker:BTC/USDT"], "id": req["id"]}));
+    let r = t.await.unwrap().unwrap();
+    let rejected: Vec<&str> = r.rejected.iter().map(|(c, _)| c.as_str()).collect();
+    assert_eq!(rejected, ["ticker:nope_usdt"]);
+    assert!(ws.channels().contains(&"ticker:btc_usdt".to_string()));
+
     // Fewer errors than missing channels (the server's subscription cap stops the frame): the last
     // error covers the rest.
     let t = subscribe_task(&ws, &["ticker:A/B", "ticker:C/D", "ticker:E/F"]);
@@ -622,4 +633,127 @@ async fn futures_account_waits_for_auth_then_follows_sign_out() {
     assert_eq!(ws.pending_channels(), ["futures.account"]);
     assert_eq!(ws.channels(), ["futures.status"]);
     ws.close().await;
+}
+
+/// conformance/ws/subscribe_refusals.json: refusals collected per request id, paired with the
+/// channels missing from the ack (canonical spot names), never attributed to another request.
+#[tokio::test]
+async fn subscribe_refusals_conformance() {
+    let Some(spec) = load("ws/subscribe_refusals.json") else {
+        return;
+    };
+    let cases = spec["cases"].as_array().unwrap();
+    assert_eq!(cases.len(), 7);
+    for case in cases {
+        let id = case["id"].as_str().unwrap();
+        let mut srv = Server::start_with(welcome()).await;
+        let (ws, mut rx, mut conn) = connected(&mut srv).await;
+        // (name, channels) of each request; a single request is "r".
+        let requests: Vec<(String, Vec<String>)> = match case.get("concurrent") {
+            Some(c) => c
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| {
+                    (
+                        r["request"].as_str().unwrap().to_string(),
+                        strings(&r["send"]),
+                    )
+                })
+                .collect(),
+            None => vec![("r".to_string(), strings(&case["send"]))],
+        };
+        let start = std::time::Instant::now();
+        let mut tasks = vec![];
+        let mut ids = std::collections::HashMap::new();
+        for (name, channels) in &requests {
+            let refs: Vec<&str> = channels.iter().map(String::as_str).collect();
+            tasks.push((name.clone(), channels.clone(), subscribe_task(&ws, &refs)));
+            let req = conn.recv().await;
+            assert_eq!(
+                strings(&req["channels"]),
+                *channels,
+                "{id}: one frame per subscribe"
+            );
+            ids.insert(name.clone(), req["id"].clone());
+        }
+        for step in case["server"].as_array().unwrap() {
+            let (to, mut frame) = match step.get("frame") {
+                Some(f) => (step["to"].as_str().unwrap().to_string(), f.clone()),
+                None => ("r".to_string(), step.clone()),
+            };
+            frame["id"] = ids[&to].clone();
+            conn.send(frame);
+        }
+        for (name, sent, task) in tasks {
+            let at = format!("{id} {name}");
+            let expect = match case["expect"].get(&name) {
+                Some(e) => e,
+                None => &case["expect"],
+            };
+            let result = task.await.unwrap();
+            if let Some(code) = expect["error_code"].as_str() {
+                let e = result.unwrap_err();
+                assert!(
+                    matches!(&e, Error::WebSocket(w) if w.code == code),
+                    "{at}: {e}"
+                );
+                for c in strings(&expect["held_after"]) {
+                    assert!(ws.channels().contains(&c), "{at}: {c} held");
+                }
+                continue;
+            }
+            let refused = expect["refused"].as_object().unwrap();
+            if expect["fails"].as_bool().unwrap() {
+                let e = result.unwrap_err();
+                let first = refused.values().next().unwrap().as_str().unwrap();
+                assert!(
+                    matches!(&e, Error::WebSocket(w) if w.code == first && w.from_server),
+                    "{at}: {e}"
+                );
+                if expect["completes_before_timeout"].as_bool() == Some(true) {
+                    assert!(
+                        start.elapsed() < Duration::from_millis(400),
+                        "{at}: waited for the timeout"
+                    );
+                }
+            } else {
+                let r = result.unwrap_or_else(|e| panic!("{at}: {e}"));
+                assert_eq!(r.added, strings(&expect["added"]), "{at}: added");
+                let got: Vec<(String, String)> = r
+                    .rejected
+                    .iter()
+                    .map(|(c, e)| (c.clone(), e.code.clone()))
+                    .collect();
+                let want: Vec<(String, String)> = sent
+                    .iter()
+                    .filter_map(|c| {
+                        refused
+                            .get(c)
+                            .map(|v| (c.clone(), v.as_str().unwrap().to_string()))
+                    })
+                    .collect();
+                assert_eq!(got, want, "{at}: refused");
+            }
+            for c in refused.keys() {
+                assert!(!ws.channels().contains(c), "{at}: refused {c} not held");
+            }
+        }
+        // Nothing is retried.
+        assert!(
+            settle(&ws, &mut conn).await.is_empty(),
+            "{id}: nothing resent"
+        );
+        let errors = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter(|ev| matches!(ev, WsEvent::ServerError(_)))
+            .count();
+        let frames = case["server"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|f| f["type"] == "error" || f["frame"]["type"] == "error")
+            .count();
+        assert_eq!(errors, frames, "{id}: every error frame reported once");
+        ws.close().await;
+    }
 }

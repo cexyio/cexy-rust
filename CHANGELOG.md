@@ -66,8 +66,8 @@ All notable changes to this project are documented here. The format follows
   error frame and stopped holding every channel in it. It now collects the error frames: the request
   completes on the ack, or once every channel was refused, or at `ack_timeout` (with at least one
   error: all refused). `subscribe` returns the accepted channels in `added` and the refused ones,
-  paired with the errors in the order sent (spot names compared ignoring case, as the server
-  normalises them; futures names exactly; when there are fewer errors than refused channels, after
+  paired with the errors in the order sent (spot names compared as the server canonicalises them:
+  ignoring case, with `_` as `/` in the market, so `ticker:btc_usdt` matches `ticker:BTC/USDT`; futures names exactly; when there are fewer errors than refused channels, after
   the server's 100-subscription stop, the last error covers the rest), in `rejected`; it fails only when every channel sent was
   refused (or on a disconnect). Refused channels are not held and not retried. A subscribe is still
   one frame.

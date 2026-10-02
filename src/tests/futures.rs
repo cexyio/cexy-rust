@@ -377,7 +377,22 @@ async fn max_items_stops_paging_early() {
     assert_eq!(s.received_requests().await.unwrap().len(), 1);
 }
 
-/// conformance/futures/history_paging.json: cursors sent, rows yielded, requests, sleeps.
+/// One history page answer: a 200 in the data envelope, or an error (`http_status`).
+fn page_reply(p: &Value) -> ResponseTemplate {
+    match p["http_status"].as_u64() {
+        Some(status) => {
+            let mut r = ResponseTemplate::new(status as u16).set_body_json(p["response"].clone());
+            for (k, v) in p["headers"].as_object().into_iter().flatten() {
+                r = r.insert_header(k.as_str(), v.as_str().unwrap());
+            }
+            r
+        }
+        None => data(p["response"].clone()),
+    }
+}
+
+/// conformance/futures/history_paging.json: cursors sent, rows yielded, requests, sleeps, for
+/// fills (`cases`, row ids) and funding (`funding_cases`, row times).
 #[tokio::test]
 async fn history_paging_conformance() {
     let Some(file) = load("futures/history_paging.json") else {
@@ -391,101 +406,144 @@ async fn history_paging_conformance() {
         .and_then(Value::as_u64)
         .unwrap();
     assert_eq!(busy, u64::from(DEFAULT_MAX_BUSY_RETRIES));
-    let cases = file["cases"].as_array().unwrap();
-    assert!(cases.len() >= 5);
-    // The busy retries do not depend on the client's request retries: run every case on the
-    // default client and on one with retries disabled.
-    for (case, max_retries) in cases.iter().flat_map(|c| [(c, None), (c, Some(0))]) {
-        let id = &format!(
-            "{} (max_retries {max_retries:?})",
-            case["id"].as_str().unwrap()
-        );
-        let expect = &case["expect"];
-        let pages = case["pages"].as_array().unwrap();
-        let s = MockServer::start().await;
-        Mock::given(path("/api/v1/futures/fills"))
-            .respond_with(Sequence::new(
-                pages.iter().map(|p| data(p["response"].clone())).collect(),
-            ))
-            .mount(&s)
-            .await;
-        let (c, clock) = client_with(&s, true, |o| o.max_retries = max_retries);
-        let items: Vec<_> = c.futures().all_fills(None).collect().await;
-        let ids: Vec<&str> = items
+    let fills = file["cases"].as_array().unwrap();
+    assert!(fills.len() >= 5);
+    let funding = file["funding_cases"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let all = fills
+        .iter()
+        .map(|c| (c, "fills"))
+        .chain(funding.iter().map(|c| (c, "funding")));
+    for (case, op) in all {
+        // The busy retries do not depend on the client's request retries: run every case on the
+        // default client, and the ones without an HTTP error (which needs the request retries)
+        // on a client with retries disabled too.
+        let has_http_error = case["pages"]
+            .as_array()
+            .unwrap()
             .iter()
-            .filter_map(|r| r.as_ref().ok())
-            .map(|f| f.id.as_str())
-            .collect();
-        let err = items.iter().find_map(|r| r.as_ref().err());
+            .any(|p| p.get("http_status").is_some());
+        let mut runs = vec![None];
+        if !has_http_error {
+            runs.push(Some(0));
+        }
+        for max_retries in runs {
+            run_history_case(case, op, max_retries).await;
+        }
+    }
+}
 
-        if let Some(code) = expect["error_code"].as_str() {
-            let want: Vec<&str> = expect["ids_before_error"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|v| v.as_str().unwrap())
-                .collect();
-            assert_eq!(ids, want, "{id}: ids before the error");
-            let e = err.unwrap_or_else(|| panic!("{id}: want an error"));
-            assert!(
-                items.last().unwrap().is_err(),
-                "{id}: the error ends the stream"
-            );
-            assert_eq!(e.code(), Some(code), "{id}");
-            assert!(
-                [PAGING_STALLED, PAGING_CURSOR_REPEATED].contains(&code),
-                "{id}"
-            );
-            assert_eq!(
-                e.is_retryable(),
-                expect["error_retryable"].as_bool().unwrap(),
-                "{id}"
-            );
+async fn run_history_case(case: &Value, op: &str, max_retries: Option<u32>) {
+    let id = &format!(
+        "{} {op} (max_retries {max_retries:?})",
+        case["id"].as_str().unwrap()
+    );
+    let expect = &case["expect"];
+    let pages = case["pages"].as_array().unwrap();
+    let route = format!("/api/v1/futures/{op}");
+    let s = MockServer::start().await;
+    Mock::given(path(route.as_str()))
+        .respond_with(Sequence::new(pages.iter().map(page_reply).collect()))
+        .mount(&s)
+        .await;
+    let (c, clock) = client_with(&s, true, |o| o.max_retries = max_retries);
+    // Fills are identified by id, funding rows (no id) by time.
+    let items: Vec<crate::Result<Value>> = if op == "fills" {
+        c.futures()
+            .all_fills(None)
+            .map(|r| r.map(|f| json!(f.id)))
+            .collect()
+            .await
+    } else {
+        c.futures()
+            .all_funding(None)
+            .map(|r| r.map(|f| json!(f.time)))
+            .collect()
+            .await
+    };
+    let keys: Vec<Value> = items
+        .iter()
+        .filter_map(|r| r.as_ref().ok())
+        .cloned()
+        .collect();
+    let err = items.iter().find_map(|r| r.as_ref().err());
+
+    if let Some(code) = expect["error_code"].as_str() {
+        assert_eq!(
+            &json!(keys),
+            &expect["ids_before_error"],
+            "{id}: rows before the error"
+        );
+        let e = err.unwrap_or_else(|| panic!("{id}: want an error"));
+        assert!(
+            items.last().unwrap().is_err(),
+            "{id}: the error ends the stream"
+        );
+        assert_eq!(e.code(), Some(code), "{id}");
+        assert!(
+            [PAGING_STALLED, PAGING_CURSOR_REPEATED].contains(&code),
+            "{id}"
+        );
+        assert_eq!(
+            e.is_retryable(),
+            expect["error_retryable"].as_bool().unwrap(),
+            "{id}"
+        );
+    } else {
+        assert!(err.is_none(), "{id}: {err:?}");
+        let want = if op == "fills" {
+            &expect["ids"]
         } else {
-            assert!(err.is_none(), "{id}: {err:?}");
-            let want: Vec<&str> = expect["ids"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|v| v.as_str().unwrap())
-                .collect();
-            assert_eq!(ids, want, "{id}: ids");
-        }
+            &expect["times"]
+        };
+        assert_eq!(&json!(keys), want, "{id}: rows");
+    }
 
-        let reqs = s.received_requests().await.unwrap();
-        assert_eq!(
-            reqs.len() as u64,
-            expect["requests"].as_u64().unwrap(),
-            "{id}: requests"
+    let reqs = s.received_requests().await.unwrap();
+    assert_eq!(
+        reqs.len() as u64,
+        expect["requests"].as_u64().unwrap(),
+        "{id}: requests"
+    );
+    let sleeps = clock.sleeps();
+    assert_eq!(
+        sleeps.len() as u64,
+        expect["sleeps"].as_u64().unwrap(),
+        "{id}: sleeps"
+    );
+    if let Some(min) = expect["min_sleep_seconds"].as_u64() {
+        assert!(
+            sleeps
+                .iter()
+                .all(|d| *d >= std::time::Duration::from_secs(min)),
+            "{id}: {sleeps:?}"
         );
+    }
+    for (i, (req, page)) in reqs.iter().zip(pages).enumerate() {
+        let sent: Option<String> = req
+            .url
+            .query_pairs()
+            .find(|(k, _)| k == "cursor")
+            .map(|(_, v)| v.into_owned());
         assert_eq!(
-            clock.sleeps().len() as u64,
-            expect["sleeps"].as_u64().unwrap(),
-            "{id}: sleeps"
+            sent.as_deref(),
+            page["request_cursor"].as_str(),
+            "{id}: cursor of request {}",
+            i + 1
         );
-        for (i, (req, page)) in reqs.iter().zip(pages).enumerate() {
-            let sent: Option<String> = req
-                .url
-                .query_pairs()
-                .find(|(k, _)| k == "cursor")
-                .map(|(_, v)| v.into_owned());
-            assert_eq!(
-                sent.as_deref(),
-                page["request_cursor"].as_str(),
-                "{id}: cursor of request {}",
-                i + 1
-            );
-            assert!(req.headers.contains_key("x-api-signature"), "{id}: signed");
-        }
-        if let Some(q) = expect["encoded_query_of_request_2"].as_str() {
-            assert_eq!(reqs[1].url.query(), Some(q), "{id}: encoded query");
-        }
-        if let Some(has) = expect["has_account"].as_bool() {
-            assert_eq!(
-                c.futures().fills(None).await.unwrap().has_account,
-                has,
-                "{id}"
-            );
-        }
+        assert!(req.headers.contains_key("x-api-signature"), "{id}: signed");
+    }
+    if let Some(q) = expect["encoded_query_of_request_2"].as_str() {
+        assert_eq!(reqs[1].url.query(), Some(q), "{id}: encoded query");
+    }
+    if let Some(has) = expect["has_account"].as_bool() {
+        let got = if op == "fills" {
+            c.futures().fills(None).await.unwrap().has_account
+        } else {
+            c.futures().funding(None).await.unwrap().has_account
+        };
+        assert_eq!(got, has, "{id}");
     }
 }

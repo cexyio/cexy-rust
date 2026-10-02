@@ -1305,15 +1305,15 @@ impl Inner {
         let mut rejected = vec![];
         if let Some(last) = errors.last() {
             // The channels missing from the ack are the refused ones, paired with the errors in the
-            // order sent. The server normalises spot names (compared ignoring case), not futures
-            // coins (compared exactly). After its 100-subscription cap it stops with one error: the
+            // order sent. The server canonicalises spot names (compared ignoring case, with `_`
+            // as `/` in the market), not futures coins (compared exactly). After its 100-subscription cap it stops with one error: the
             // last error covers the rest.
             let acked = |c: &String| {
                 added.iter().any(|a| {
                     if c.starts_with("futures.") {
                         a == c
                     } else {
-                        a.eq_ignore_ascii_case(c)
+                        spot_key(a) == spot_key(c)
                     }
                 })
             };
@@ -2157,6 +2157,18 @@ fn parse_frame(m: &Message) -> Option<Map<String, Value>> {
     match serde_json::from_str::<Value>(text) {
         Ok(Value::Object(m)) => Some(m),
         _ => None,
+    }
+}
+
+/// A spot channel name as the server canonicalises it: `ticker:btc_usdt` is `ticker:BTC/USDT`.
+fn spot_key(c: &str) -> String {
+    match c.split_once(':') {
+        Some((kind, market)) => format!(
+            "{}:{}",
+            kind.to_ascii_lowercase(),
+            market.to_ascii_uppercase().replace('_', "/")
+        ),
+        None => c.to_ascii_lowercase(),
     }
 }
 
