@@ -8,6 +8,7 @@ use serde_json::{Value, json};
 use super::helpers::{KEY, SECRET, load};
 use super::ws::{Conn, Server, options};
 use super::ws_signout::{norm_sent, sorted};
+use crate::ws::channel_key;
 use crate::{
     Client, ClientOptions, Error, FuturesBookUpdate, FuturesCandleUpdate, FuturesChannel,
     FuturesMids, FuturesOrdersUpdate, FuturesPositionsUpdate, FuturesStatus, FuturesTradesUpdate,
@@ -457,16 +458,21 @@ async fn subscribe_refusals_are_collected_until_the_ack() {
     assert_eq!(r.rejected.len(), 1);
     assert_eq!(r.rejected[0].0, "futures.trades:btc");
 
-    // The server rewrites `_` to `/` in a spot market: `ticker:btc_usdt` is acked as
-    // `ticker:BTC/USDT`, so only the other channel was refused.
-    let t = subscribe_task(&ws, &["ticker:btc_usdt", "ticker:nope_usdt"]);
+    // The server rewrites `_` to `/` in a spot market: `ticker:sol_usdt` is acked as
+    // `ticker:SOL/USDT`, so only the other channel was refused.
+    let t = subscribe_task(&ws, &["ticker:sol_usdt", "ticker:nope_usdt"]);
     let req = conn.recv().await;
     conn.send(refusal("NOT_FOUND", &req["id"]));
-    conn.send(json!({"type": "subscribed", "channels": ["ticker:BTC/USDT"], "id": req["id"]}));
+    conn.send(json!({"type": "subscribed", "channels": ["ticker:SOL/USDT"], "id": req["id"]}));
     let r = t.await.unwrap().unwrap();
     let rejected: Vec<&str> = r.rejected.iter().map(|(c, _)| c.as_str()).collect();
     assert_eq!(rejected, ["ticker:nope_usdt"]);
-    assert!(ws.channels().contains(&"ticker:btc_usdt".to_string()));
+    assert!(ws.channels().contains(&"ticker:sol_usdt".to_string()));
+
+    // Another spelling of a held channel is already held: nothing is sent.
+    let r = ws.subscribe(&["ticker:btc_usdt"]).await.unwrap();
+    assert_eq!(r.already_subscribed, ["ticker:btc_usdt"]);
+    assert!(r.added.is_empty());
 
     // Fewer errors than missing channels (the server's subscription cap stops the frame): the last
     // error covers the rest.
@@ -487,6 +493,25 @@ async fn subscribe_refusals_are_collected_until_the_ack() {
             ("ticker:E/F", "RATE_LIMITED")
         ]
     );
+
+    // Channel kinds match exactly: `Ticker:XRP/USDT` is another channel (refused
+    // VALIDATION_FAILED), so both spellings are sent and only `ticker:XRP/USDT` is acked.
+    let t = subscribe_task(&ws, &["Ticker:XRP/USDT", "ticker:XRP/USDT"]);
+    let req = conn.recv().await;
+    assert_eq!(
+        req["channels"],
+        json!(["Ticker:XRP/USDT", "ticker:XRP/USDT"])
+    );
+    conn.send(refusal("VALIDATION_FAILED", &req["id"]));
+    conn.send(json!({"type": "subscribed", "channels": ["ticker:XRP/USDT"], "id": req["id"]}));
+    let r = t.await.unwrap().unwrap();
+    assert_eq!(r.added, ["ticker:XRP/USDT"]);
+    let rejected: Vec<(&str, &str)> = r
+        .rejected
+        .iter()
+        .map(|(c, e)| (c.as_str(), e.code.as_str()))
+        .collect();
+    assert_eq!(rejected, [("Ticker:XRP/USDT", "VALIDATION_FAILED")]);
 
     // No ack and no error within ack_timeout: TIMEOUT, and the channel stays held (a reconnect
     // sends it again).
@@ -643,7 +668,7 @@ async fn subscribe_refusals_conformance() {
         return;
     };
     let cases = spec["cases"].as_array().unwrap();
-    assert_eq!(cases.len(), 7);
+    assert_eq!(cases.len(), 11);
     for case in cases {
         let id = case["id"].as_str().unwrap();
         let mut srv = Server::start_with(welcome()).await;
@@ -670,10 +695,22 @@ async fn subscribe_refusals_conformance() {
             let refs: Vec<&str> = channels.iter().map(String::as_str).collect();
             tasks.push((name.clone(), channels.clone(), subscribe_task(&ws, &refs)));
             let req = conn.recv().await;
+            // Two spellings of one channel are sent once (rule 4).
+            let mut deduped: Vec<String> = vec![];
+            for c in channels {
+                if !deduped.iter().any(|d| channel_key(d) == channel_key(c)) {
+                    deduped.push(c.clone());
+                }
+            }
             assert_eq!(
                 strings(&req["channels"]),
-                *channels,
+                deduped,
                 "{id}: one frame per subscribe"
+            );
+            // Every subscribe carries an id (rule 11).
+            assert!(
+                req["id"].as_str().is_some_and(|i| !i.is_empty()),
+                "{id}: subscribe has an id"
             );
             ids.insert(name.clone(), req["id"].clone());
         }
@@ -682,7 +719,11 @@ async fn subscribe_refusals_conformance() {
                 Some(f) => (step["to"].as_str().unwrap().to_string(), f.clone()),
                 None => ("r".to_string(), step.clone()),
             };
-            frame["id"] = ids[&to].clone();
+            // Answers carry the request id; events and frames with their own (null) id do not.
+            let answer = frame["type"] == "error" || frame["type"] == "subscribed";
+            if answer && frame.get("id").is_none() {
+                frame["id"] = ids[&to].clone();
+            }
             conn.send(frame);
         }
         for (name, sent, task) in tasks {
@@ -692,15 +733,21 @@ async fn subscribe_refusals_conformance() {
                 None => &case["expect"],
             };
             let result = task.await.unwrap();
+            // Held under any spelling the server canonicalises alike.
+            for c in strings(&expect["held_after"]) {
+                assert!(
+                    ws.channels()
+                        .iter()
+                        .any(|h| channel_key(h) == channel_key(&c)),
+                    "{at}: {c} held"
+                );
+            }
             if let Some(code) = expect["error_code"].as_str() {
                 let e = result.unwrap_err();
                 assert!(
                     matches!(&e, Error::WebSocket(w) if w.code == code),
                     "{at}: {e}"
                 );
-                for c in strings(&expect["held_after"]) {
-                    assert!(ws.channels().contains(&c), "{at}: {c} held");
-                }
                 continue;
             }
             let refused = expect["refused"].as_object().unwrap();
@@ -719,7 +766,9 @@ async fn subscribe_refusals_conformance() {
                 }
             } else {
                 let r = result.unwrap_or_else(|e| panic!("{at}: {e}"));
-                assert_eq!(r.added, strings(&expect["added"]), "{at}: added");
+                if expect.get("added").is_some() {
+                    assert_eq!(r.added, strings(&expect["added"]), "{at}: added");
+                }
                 let got: Vec<(String, String)> = r
                     .rejected
                     .iter()
@@ -744,9 +793,24 @@ async fn subscribe_refusals_conformance() {
             settle(&ws, &mut conn).await.is_empty(),
             "{id}: nothing resent"
         );
-        let errors = std::iter::from_fn(|| rx.try_recv().ok())
+        let events: Vec<WsEvent> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        let errors = events
+            .iter()
             .filter(|ev| matches!(ev, WsEvent::ServerError(_)))
             .count();
+        // Events for a channel whose subscribe is in flight are delivered, not dropped (rule 10).
+        let delivered: Vec<String> = events
+            .iter()
+            .filter_map(|ev| match ev {
+                WsEvent::Event(f) => Some(f.r#type.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            delivered,
+            strings(&case["expect"]["events_delivered"]),
+            "{id}: events delivered"
+        );
         let frames = case["server"]
             .as_array()
             .unwrap()

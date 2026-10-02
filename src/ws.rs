@@ -174,7 +174,8 @@ pub struct SubscribeResult {
     pub added: Vec<String>,
     /// Channels refused locally because the subscription cap was reached.
     pub refused: Vec<String>,
-    /// Channels already held (nothing was sent for them).
+    /// Channels already held, under this or another spelling the server canonicalises alike
+    /// (nothing was sent for them).
     pub already_subscribed: Vec<String>,
     /// Channels the server refused, with its error (one error frame per refused channel, in the
     /// order sent). They are not held and not retried automatically (WebSocket error frames carry
@@ -825,7 +826,13 @@ impl WebSocket {
     /// [`Error::Config`]). `futures.account` on a connection that is not signed in is held in
     /// [`SubscribeResult::pending`] until auth succeeds.
     pub async fn subscribe(&self, channels: &[&str]) -> Result<SubscribeResult> {
-        let wanted = uniq(channels.iter().map(|c| c.to_string()));
+        // Two spellings of one channel (`ticker:btc_usdt`, `ticker:BTC/USDT`) are sent once.
+        let mut wanted: Vec<String> = vec![];
+        for c in channels {
+            if !wanted.iter().any(|w| channel_key(w) == channel_key(c)) {
+                wanted.push(c.to_string());
+            }
+        }
         if let Some(bad) = wanted
             .iter()
             .find(|c| c.is_empty() || c.len() > MAX_CHANNEL_LENGTH)
@@ -841,7 +848,12 @@ impl WebSocket {
             let mut fresh = vec![];
             for c in wanted {
                 // Private channels waiting for the next successful auth count as held.
-                if s.channels.contains(&c) || s.pending_private.contains(&c) {
+                let k = channel_key(&c);
+                if s.channels
+                    .iter()
+                    .chain(&s.pending_private)
+                    .any(|h| channel_key(h) == k)
+                {
                     res.already_subscribed.push(c);
                 } else {
                     fresh.push(c);
@@ -1305,24 +1317,26 @@ impl Inner {
         let mut rejected = vec![];
         if let Some(last) = errors.last() {
             // The channels missing from the ack are the refused ones, paired with the errors in the
-            // order sent. The server canonicalises spot names (compared ignoring case, with `_`
-            // as `/` in the market), not futures coins (compared exactly). After its 100-subscription cap it stops with one error: the
-            // last error covers the rest.
-            let acked = |c: &String| {
-                added.iter().any(|a| {
-                    if c.starts_with("futures.") {
-                        a == c
-                    } else {
-                        spot_key(a) == spot_key(c)
+            // order sent. Ack names are matched as a multiset (the ack can repeat a name) with the
+            // server's canonicalisation (see `channel_key`: kinds and futures names exactly, spot
+            // markets uppercased with `_` as `/`). After its 100-subscription cap it stops with
+            // one error: the last error covers the rest.
+            let mut pool: Vec<String> = added.iter().map(|a| channel_key(a)).collect();
+            let missing = channels.into_iter().filter(|c| {
+                let k = channel_key(c);
+                match pool.iter().position(|a| *a == k) {
+                    Some(i) => {
+                        pool.swap_remove(i);
+                        false
                     }
-                })
-            };
-            let missing = channels.into_iter().filter(|c| !acked(c));
+                    None => true,
+                }
+            });
             for (i, c) in missing.enumerate() {
                 rejected.push((c, errors.get(i).unwrap_or(last).clone()));
             }
         }
-        Ok((added, rejected))
+        Ok((uniq(added), rejected))
     }
 
     pub(crate) async fn unsubscribe(this: &Arc<Inner>, channels: Vec<String>) -> Result<()> {
@@ -2160,15 +2174,21 @@ fn parse_frame(m: &Message) -> Option<Map<String, Value>> {
     }
 }
 
-/// A spot channel name as the server canonicalises it: `ticker:btc_usdt` is `ticker:BTC/USDT`.
-fn spot_key(c: &str) -> String {
+/// A channel name as the server canonicalises it: the whole name is trimmed, the channel kind
+/// matches exactly (`Ticker:BTC/USDT` is not `ticker:BTC/USDT`), a spot market symbol is trimmed,
+/// uppercased and `_` becomes `/` (`ticker:btc_usdt` is `ticker:BTC/USDT`), and futures names
+/// match exactly (coins are case-sensitive).
+pub(crate) fn channel_key(c: &str) -> String {
+    let c = c.trim();
+    if c.starts_with("futures.") {
+        return c.to_string();
+    }
     match c.split_once(':') {
         Some((kind, market)) => format!(
-            "{}:{}",
-            kind.to_ascii_lowercase(),
-            market.to_ascii_uppercase().replace('_', "/")
+            "{kind}:{}",
+            market.trim().to_ascii_uppercase().replace('_', "/")
         ),
-        None => c.to_ascii_lowercase(),
+        None => c.to_string(),
     }
 }
 

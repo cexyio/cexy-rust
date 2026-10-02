@@ -67,13 +67,19 @@ All notable changes to this project are documented here. The format follows
   completes on the ack, or once every channel was refused, or at `ack_timeout` (with at least one
   error: all refused). `subscribe` returns the accepted channels in `added` and the refused ones,
   paired with the errors in the order sent (spot names compared as the server canonicalises them:
-  ignoring case, with `_` as `/` in the market, so `ticker:btc_usdt` matches `ticker:BTC/USDT`; futures names exactly; when there are fewer errors than refused channels, after
+  the market uppercased, with `_` as `/`, so `ticker:btc_usdt` matches `ticker:BTC/USDT`; futures names exactly; when there are fewer errors than refused channels, after
   the server's 100-subscription stop, the last error covers the rest), in `rejected`; it fails only when every channel sent was
   refused (or on a disconnect). Refused channels are not held and not retried. A subscribe is still
   one frame.
 - The automatic re-subscription after a reconnect or a re-auth sorts refusals the same way: a
   private channel refused as `UNAUTHENTICATED` waits for the next successful auth; any other refusal
   drops the channel and is reported as `WsEvent::Error`.
+- Subscribe ack matching (conformance/ws/subscribe_refusals.json, spec ace4a5e): the channel kind
+  matched ignoring case, so `Ticker:BTC/USDT` (refused `VALIDATION_FAILED` by the server) could take
+  the ack of `ticker:BTC/USDT`. Kinds now match exactly; only the spot market symbol is
+  canonicalised (trimmed, uppercased, `_` as `/`), and the whole name is trimmed. Ack names are
+  matched as a multiset (the ack can repeat a name). `subscribe` sends two spellings of one channel
+  once, and reports a channel already held under another spelling in `already_subscribed`.
 
 ## [0.1.0-dev.8] (2026-10-01)
 
