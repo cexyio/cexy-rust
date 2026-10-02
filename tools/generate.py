@@ -40,6 +40,10 @@ RENAMES = {
     "CancelFailureResponse": "CancelFailure",
     "JoinPoolResponse": "JoinPoolResult",
     "ExitPoolResponse": "ExitPoolResult",
+    # Futures schemas whose bare names are taken by the spot models (CandleResponse -> Candle, ...).
+    "Candle": "FuturesCandle",
+    "Fill": "FuturesFill",
+    "PublicTrade": "FuturesPublicTrade",
 }
 
 # Operations whose query parameters are identical share one params struct.

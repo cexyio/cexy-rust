@@ -1,6 +1,6 @@
 [package]
 name = "cexy"
-version = "0.1.0-dev.8"
+version = "0.1.0-dev.9"
 edition = "2024"
 rust-version = "1.94"
 description = "Official Rust SDK for the CEXY.io exchange API (REST + WebSocket)"

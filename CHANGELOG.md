@@ -6,6 +6,31 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-dev.9] (2026-10-02)
+
+### Added
+- Futures data, read only: `Client::futures()` returns `Futures`, with the market data (public)
+  `markets`, `market(coin)`, `order_book(coin, depth)`, `candles(coin, &CandlesParams)` and
+  `trades(coin, limit)`, and the account's own data (API key with the `read` scope, signed)
+  `positions`, `open_orders`, `fills(cursor)` and `funding(cursor)`. The 9 operations and their
+  models come from the spec (`FuturesMarkets`, `FuturesMarket`, `PerpMarket`, `FuturesBook`, `Level`,
+  `FuturesCandles`, `FuturesTrades`, `FuturesPositions`, `Positions`, `Position`,
+  `FuturesOpenOrders`, `OpenOrder`, `FuturesFills`, `FuturesFunding`, `Funding`). The spec's futures
+  `Candle`, `Fill` and `PublicTrade` are generated as `FuturesCandle`, `FuturesFill` and
+  `FuturesPublicTrade`: the bare names are the spot models'.
+- `Futures::all_fills` and `Futures::all_funding` stream the whole history (30 days back), following
+  conformance/futures/history_paging.json: the opaque cursor is sent back verbatim (RFC 3986 in the
+  query), short and empty pages are followed until `next_cursor` is null, an empty page that repeats
+  the cursor just sent (the provider is busy) is retried with the same cursor after the retry backoff
+  at most `max_busy_retries` times (`DEFAULT_MAX_BUSY_RETRIES`, 3; `Futures::with_max_busy_retries`
+  changes it, independently of the client's `max_retries`), a page with rows that repeats a cursor
+  already sent yields its rows and then stops, and `has_account: false` yields nothing.
+- Local paging errors that end those streams; the rows before them are not the whole history, and
+  both carry the cursor: `Error::PagingStalled` (code `PAGING_STALLED`, retryable: the provider stayed
+  busy) and `Error::PagingCursorRepeated` (code `PAGING_CURSOR_REPEATED`, not retryable: the server
+  repeated a cursor after a page of rows). `PAGING_STALLED` and `PAGING_CURSOR_REPEATED` are exported;
+  `Error::code()` returns the code of an API, WebSocket or paging error.
+
 ## [0.1.0-dev.8] (2026-10-01)
 
 ### Changed

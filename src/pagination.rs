@@ -7,7 +7,7 @@ use std::pin::Pin;
 use futures_util::Stream;
 use serde::Deserialize;
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 
 /// One page of a cursor-paginated listing.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -86,6 +86,125 @@ where
                         _ => s.done = true,
                     }
                 }
+            }
+        }
+    }))
+}
+
+/// One page of a futures account history (fills, funding), reduced to what paging needs.
+pub(crate) struct HistoryPage<T> {
+    pub(crate) rows: Vec<T>,
+    pub(crate) has_account: bool,
+    pub(crate) next_cursor: Option<String>,
+}
+
+struct HistoryState<F, W, T> {
+    fetch: F,
+    wait: W,
+    operation: &'static str,
+    max_busy_retries: u32,
+    cursor: Option<String>,
+    retries: u32,
+    buffer: VecDeque<T>,
+    seen: HashSet<String>,
+    yielded: usize,
+    max_items: Option<usize>,
+    done: bool,
+    /// An error to yield once the buffered rows are out.
+    pending: Option<Error>,
+}
+
+/// Walks a futures account history (conformance/futures/history_paging.json):
+///
+/// - the first request sends no cursor; each `next_cursor` is sent back exactly as given;
+/// - a page may be short, even empty, and still have a `next_cursor`: paging goes on until it is
+///   `None`;
+/// - an EMPTY page whose `next_cursor` is the cursor just sent means the provider is busy: `wait`
+///   (the transport's backoff, on the client's clock) and ask for the same cursor again, at most
+///   `max_busy_retries` times in a row (its own setting, not the client's request retries), then
+///   yield [`Error::PagingStalled`] (retryable) and stop;
+/// - a page WITH rows whose `next_cursor` was already sent would repeat rows: its rows are
+///   yielded, then [`Error::PagingCursorRepeated`] (not retryable), never a loop;
+/// - `has_account` false ends the stream with no rows.
+pub(crate) fn paginate_history<'a, T, F, Fut, W, WFut>(
+    operation: &'static str,
+    max_busy_retries: u32,
+    max_items: Option<usize>,
+    fetch: F,
+    wait: W,
+) -> ItemStream<'a, T>
+where
+    T: Send + 'a,
+    F: FnMut(Option<String>) -> Fut + Send + 'a,
+    Fut: Future<Output = Result<HistoryPage<T>>> + Send + 'a,
+    W: FnMut(u32, Error) -> WFut + Send + 'a,
+    WFut: Future<Output = ()> + Send + 'a,
+{
+    let state = HistoryState {
+        fetch,
+        wait,
+        operation,
+        max_busy_retries,
+        cursor: None,
+        retries: 0,
+        buffer: VecDeque::new(),
+        seen: HashSet::new(),
+        yielded: 0,
+        max_items,
+        done: false,
+        pending: None,
+    };
+    Box::pin(futures_util::stream::unfold(state, |mut s| async move {
+        loop {
+            if s.max_items.is_some_and(|m| s.yielded >= m) {
+                return None;
+            }
+            if let Some(item) = s.buffer.pop_front() {
+                s.yielded += 1;
+                return Some((Ok(item), s));
+            }
+            if s.done {
+                return s.pending.take().map(|e| (Err(e), s));
+            }
+            let page = match (s.fetch)(s.cursor.clone()).await {
+                Ok(page) => page,
+                Err(e) => {
+                    s.done = true;
+                    return Some((Err(e), s));
+                }
+            };
+            if !page.has_account {
+                s.done = true;
+                continue;
+            }
+            let next = page.next_cursor;
+            if page.rows.is_empty() && next.is_some() && next == s.cursor {
+                let stalled = Error::PagingStalled {
+                    operation: s.operation,
+                    cursor: next.unwrap_or_default(),
+                    retries: s.retries,
+                };
+                if s.retries >= s.max_busy_retries {
+                    s.done = true;
+                    return Some((Err(stalled), s));
+                }
+                (s.wait)(s.retries, stalled).await;
+                s.retries += 1;
+                continue;
+            }
+            s.retries = 0;
+            s.buffer.extend(page.rows);
+            match next {
+                None => s.done = true,
+                Some(n) if !s.seen.insert(n.clone()) => {
+                    s.done = true;
+                    // The rows of this page first, then the error.
+                    s.pending = Some(Error::PagingCursorRepeated {
+                        operation: s.operation,
+                        cursor: n,
+                    });
+                }
+                Some(n) => s.cursor = Some(n),
             }
         }
     }))

@@ -46,7 +46,8 @@ pub use client::{
     DEFAULT_RPM_WITH_KEY, OnRetry, is_local_host,
 };
 pub use error::{
-    ApiError, ConnectionError, Error, ErrorCategory, MAX_SERVER_WAIT, Result, WsError,
+    ApiError, ConnectionError, Error, ErrorCategory, MAX_SERVER_WAIT, PAGING_CURSOR_REPEATED,
+    PAGING_STALLED, Result, WsError,
 };
 pub use limiter::RateLimitState;
 pub use live_balances::{
@@ -57,7 +58,8 @@ pub use operations_gen::*;
 pub use orderbook::{BookSnapshot, LiveOrderBook, WS_BOOK_DEPTH};
 pub use pagination::{ItemStream, Page};
 pub use services::{
-    Account, Assets, Exports, Fees, Markets, Networks, PlaceOrderResult, Pools, Trading, Wallet,
+    Account, Assets, DEFAULT_MAX_BUSY_RETRIES, Exports, Fees, Futures, Markets, Networks,
+    PlaceOrderResult, Pools, Trading, Wallet,
 };
 pub use signing::{HmacAuthenticator, MAX_CLOCK_OFFSET, SIGNING_SCHEME};
 pub use transport::RetryInfo;

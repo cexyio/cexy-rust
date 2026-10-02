@@ -15,12 +15,12 @@ The official Rust SDK for the [CEXY.io](https://cexy.io) REST and WebSocket API.
 
 ```toml
 [dependencies]
-cexy = "=0.1.0-dev.8"
+cexy = "=0.1.0-dev.9"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
 Cargo never picks a pre-release (a version with `-dev.N`) on its own: name it explicitly. The
-exact requirement above (`=0.1.0-dev.8`) is the safest way; move it by hand for each new pre-release.
+exact requirement above (`=0.1.0-dev.9`) is the safest way; move it by hand for each new pre-release.
 
 ## Quick start: public data
 
@@ -210,6 +210,49 @@ while let Some(order) = orders.next().await {
 }
 # Ok(()) }
 ```
+
+## Futures data (read only)
+
+`client.futures()` reads futures market data (public, no key needed) and the account's own futures
+data (an API key with the `read` scope; requests are signed like every private call). Nothing here
+places orders or moves funds. Coins are the provider's names, such as `"BTC"` or `"kPEPE"`; prices
+and sizes are decimal strings.
+
+```rust
+# async fn run(c: cexy::Client) -> cexy::Result<()> {
+use futures_util::TryStreamExt;
+let f = c.futures();
+let markets = f.markets().await?; // every listed market, with `as_of` and `stale`
+let book = f.order_book("BTC", Some(10)).await?; // up to 20 levels a side
+let candles = f.candles("BTC", &cexy::CandlesParams::new("1h")).await?; // the latest 500
+let trades = f.trades("BTC", Some(50)).await?; // at most 100
+println!("{} markets, {} bids, {} candles, {} trades",
+    markets.markets.len(), book.bids.len(), candles.candles.len(), trades.trades.len());
+
+let positions = f.positions().await?;
+if !positions.has_account {
+    println!("no futures account");
+}
+let orders = f.open_orders().await?;
+// Every fill of the last 30 days, newest first (funding payments: `all_funding`).
+let fills: Vec<cexy::FuturesFill> = f.all_fills(None).try_collect().await?;
+println!("{} open orders, {} fills", orders.orders.len(), fills.len());
+# Ok(()) }
+```
+
+- Every market-data answer has `as_of` and `stale`; for books and trades, `stale` is the health of the
+  live feed, not the data's age. When nothing usable is cached the API answers 503
+  `SERVICE_UNAVAILABLE` with Retry-After, which the normal retry policy waits out.
+- Without a futures account, the account reads answer `has_account: false` (and `all_fills` /
+  `all_funding` yield nothing).
+- `fills(cursor)` and `funding(cursor)` return one page. The cursor is opaque: pass `next_cursor` back
+  exactly as given. A page can be short, even empty, and still have a `next_cursor`: keep paging until
+  it is `None`. `all_fills` / `all_funding` do this for you. When the provider is busy (an empty page
+  whose `next_cursor` is the cursor just sent), they wait with the retry backoff and ask again, at most
+  3 times (`with_max_busy_retries` changes it; the client's `max_retries` does not), then end with
+  `Error::PagingStalled` (code `PAGING_STALLED`, retryable). A page with rows that repeats a cursor
+  ends them with `Error::PagingCursorRepeated` (not retryable). Either way, the rows before the error
+  are not the whole history.
 
 ## Rate limits
 

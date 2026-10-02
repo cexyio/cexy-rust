@@ -5,6 +5,7 @@ mod cancel_all;
 mod client;
 mod conformance;
 mod errors;
+mod futures;
 mod helpers;
 mod models;
 mod pagination;
