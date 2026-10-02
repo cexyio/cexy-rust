@@ -22,6 +22,7 @@ use crate::error::{Error, Result, WsError};
 use crate::live_balances::LiveBalances;
 use crate::models_gen::ErrorCode;
 use crate::orderbook::{BookSnapshot, LiveOrderBook};
+use crate::ws_futures::{FUTURES_ACCOUNT_CHANNEL, check_channel};
 
 /// The production WebSocket endpoint.
 pub const DEFAULT_WEBSOCKET_URL: &str = "wss://api.cexy.io/api/v1/ws";
@@ -29,14 +30,24 @@ pub const DEFAULT_WEBSOCKET_URL: &str = "wss://api.cexy.io/api/v1/ws";
 /// The WebSocket protocol version this SDK was written for.
 pub const SUPPORTED_PROTOCOL_VERSION: i64 = 1;
 
-/// Channels that need [`WebSocket::auth`] with a session access token.
-pub const PRIVATE_CHANNELS: [&str; 5] =
-    ["orders", "balances", "deposits", "withdrawals", "account"];
+/// Channels that need [`WebSocket::auth`] (session access token) or [`WebSocket::auth_key`].
+pub const PRIVATE_CHANNELS: [&str; 6] = [
+    "orders",
+    "balances",
+    "deposits",
+    "withdrawals",
+    "account",
+    FUTURES_ACCOUNT_CHANNEL,
+];
+
+/// The longest client ping interval: the server closes a connection whose client is silent for
+/// 90 to 120 s. A longer `WsOptions::ping_interval` is lowered to this.
+pub const MAX_PING_INTERVAL: Duration = Duration::from_secs(60);
 
 const MAX_CHANNEL_LENGTH: usize = 64;
 const MAX_FRAME_SIZE: usize = 4 << 20;
 
-const KNOWN_EVENT_TYPES: [&str; 17] = [
+const KNOWN_EVENT_TYPES: [&str; 25] = [
     "ticker.update",
     "orderbook.update",
     "trade.new",
@@ -54,6 +65,14 @@ const KNOWN_EVENT_TYPES: [&str; 17] = [
     "balances.resync",
     "deposits.resync",
     "withdrawals.resync",
+    "futures.mids",
+    "futures.orderbook.update",
+    "futures.trades.new",
+    "futures.candle.update",
+    "futures.status",
+    "futures.positions",
+    "futures.orders",
+    "futures.resync",
 ];
 
 /// The server's first frame on every connection.
@@ -157,6 +176,13 @@ pub struct SubscribeResult {
     pub refused: Vec<String>,
     /// Channels already held (nothing was sent for them).
     pub already_subscribed: Vec<String>,
+    /// Channels the server refused, with its error. Each `futures.*` channel is sent in a request
+    /// of its own, so its refusal names it. They are not held and not retried automatically (WS
+    /// error frames carry no retry hint: back off yourself after `RATE_LIMITED`).
+    pub rejected: Vec<(String, WsError)>,
+    /// Private channels held until [`WebSocket::auth`] or [`WebSocket::auth_key`] succeeds
+    /// (`futures.account` on a connection that is not signed in): nothing was sent yet.
+    pub pending: Vec<String>,
 }
 
 /// What [`WebSocket::auth`] did.
@@ -189,6 +215,18 @@ pub enum ResyncReason {
     DepositsResync,
     /// `withdrawals.resync` (planned server frame): refetch the withdrawal list.
     WithdrawalsResync,
+}
+
+/// What happened to the channels of one automatic or explicit subscribe.
+#[derive(Default)]
+struct SubscribeOutcome {
+    added: Vec<String>,
+    /// `futures.*` channels the server refused (each was sent alone).
+    rejected: Vec<(String, WsError)>,
+    /// The other channels, sent together.
+    batch: Vec<String>,
+    /// The failure of the batch request, or a local failure of a futures request.
+    error: Option<Error>,
 }
 
 /// Carried by [`WsEvent::SequenceGap`].
@@ -383,6 +421,11 @@ pub enum WsEvent {
     Balances(crate::live_balances::BalancesEvent),
     /// A live order book changed state.
     Book(BookEvent),
+    /// `futures.resync` arrived on this channel (after its [`WsEvent::Event`]): data on it may
+    /// have been missed, so refetch it over REST. On `futures.account` the client also sends
+    /// `unsubscribe` then `subscribe` for it automatically (the server's updates stopped); a
+    /// refusal of that subscribe drops the channel and is reported as [`WsEvent::Error`].
+    ChannelResync(String),
 }
 
 /// The receiving end of the event channel.
@@ -395,7 +438,8 @@ pub struct WsOptions {
     pub url: Option<String>,
     /// Allow `ws://`, but ONLY for localhost, 127.0.0.1 or ::1 (local test servers).
     pub allow_insecure: bool,
-    /// Client ping cadence, required by the server. Default 30 s.
+    /// Client ping cadence, required by the server. Default 30 s; at most
+    /// [`MAX_PING_INTERVAL`] (a longer value is lowered to it).
     pub ping_interval: Duration,
     /// Reconnect when no frame arrives for this long. Default 75 s.
     pub liveness_timeout: Duration,
@@ -503,7 +547,7 @@ impl State {
 
 pub(crate) struct Inner {
     url: String,
-    opts: WsOptions,
+    pub(crate) opts: WsOptions,
     pub(crate) snapshots: Option<Client>,
     pub(crate) st: Mutex<State>,
     events: mpsc::Sender<WsEvent>,
@@ -599,6 +643,7 @@ impl WebSocket {
                 *v = dv;
             }
         }
+        opts.ping_interval = opts.ping_interval.min(MAX_PING_INTERVAL);
         if opts.max_subscriptions == 0 {
             opts.max_subscriptions = d.max_subscriptions;
         }
@@ -660,6 +705,13 @@ impl WebSocket {
     /// The channels currently held (restored after every reconnect).
     pub fn channels(&self) -> Vec<String> {
         self.inner.st.lock().unwrap().channels.clone()
+    }
+
+    /// Private channels waiting for the next successful [`WebSocket::auth`] or
+    /// [`WebSocket::auth_key`] (after a sign-out, or `futures.account` subscribed before signing
+    /// in). They are subscribed then.
+    pub fn pending_channels(&self) -> Vec<String> {
+        self.inner.st.lock().unwrap().pending_private.clone()
     }
 
     /// Whether a session token is kept for automatic re-authentication. A refused token and a
@@ -754,6 +806,12 @@ impl WebSocket {
     /// Subscribes to channels such as `"ticker:BTC/USDT"` and `"trades:BTC/USDT"`, and returns
     /// when the server confirms. Channels beyond `max_subscriptions` are refused locally. When
     /// not connected, channels are queued and subscribed on connect.
+    ///
+    /// Futures channels ([`crate::FuturesChannel`]) are checked locally (a bad coin or interval is
+    /// an [`Error::Config`]) and each is sent in a request of its own, so that a refusal names its
+    /// channel: refused ones are in [`SubscribeResult::rejected`] (an error when every channel
+    /// sent was refused), are not held and are not retried. `futures.account` on a connection
+    /// that is not signed in is held in [`SubscribeResult::pending`] until auth succeeds.
     pub async fn subscribe(&self, channels: &[&str]) -> Result<SubscribeResult> {
         let wanted = uniq(channels.iter().map(|c| c.to_string()));
         if let Some(bad) = wanted
@@ -761,6 +819,9 @@ impl WebSocket {
             .find(|c| c.is_empty() || c.len() > MAX_CHANNEL_LENGTH)
         {
             return Err(WsError::local("CONFIG", format!("invalid channel name: {bad:?}")).into());
+        }
+        for c in &wanted {
+            check_channel(c)?;
         }
         let mut res = SubscribeResult::default();
         let (accepted, connected) = {
@@ -779,10 +840,23 @@ impl WebSocket {
                 .opts
                 .max_subscriptions
                 .saturating_sub(s.channels.len() + s.pending_private.len());
-            let accepted: Vec<String> = fresh.iter().take(room).cloned().collect();
+            let mut accepted: Vec<String> = fresh.iter().take(room).cloned().collect();
             res.refused = fresh[accepted.len()..].to_vec();
+            let connected = s.out.is_some() && s.welcome.is_some();
+            if connected && s.auth_user_id.is_none() {
+                // futures.account is held until auth succeeds (not sent to be refused).
+                accepted.retain(|c| {
+                    if c == FUTURES_ACCOUNT_CHANNEL {
+                        res.pending.push(c.clone());
+                        false
+                    } else {
+                        true
+                    }
+                });
+                s.pending_private.extend(res.pending.iter().cloned());
+            }
             s.channels.extend(accepted.iter().cloned());
-            (accepted, s.out.is_some() && s.welcome.is_some())
+            (accepted, connected)
         };
         if !res.refused.is_empty() {
             self.inner.emit(WsEvent::Warning(format!(
@@ -793,23 +867,31 @@ impl WebSocket {
         if accepted.is_empty() || !connected {
             return Ok(res);
         }
-        match Inner::send_subscribe(&self.inner, accepted.clone()).await {
-            Ok(added) => res.added = added,
-            Err(e) => {
-                if let Error::WebSocket(w) = &e
-                    && w.from_server
-                {
-                    // Refused by the server (e.g. UNAUTHENTICATED for a private channel): not held.
-                    self.inner
-                        .st
-                        .lock()
-                        .unwrap()
-                        .channels
-                        .retain(|c| !accepted.contains(c));
-                }
-                return Err(e);
-            }
+        let out = Inner::subscribe_split(&self.inner, accepted.clone()).await;
+        res.added = out.added;
+        for (c, w) in &out.rejected {
+            self.inner.refused(c, w);
         }
+        if let Some(e) = out.error {
+            if let Error::WebSocket(w) = &e
+                && w.from_server
+            {
+                // Refused by the server (e.g. UNAUTHENTICATED for a private channel): not held.
+                self.inner
+                    .st
+                    .lock()
+                    .unwrap()
+                    .channels
+                    .retain(|c| !out.batch.contains(c));
+            }
+            return Err(e);
+        }
+        if out.rejected.len() == accepted.len()
+            && let Some((_, w)) = out.rejected.first()
+        {
+            return Err(w.clone().into());
+        }
+        res.rejected = out.rejected;
         Ok(res)
     }
 
@@ -1038,10 +1120,35 @@ impl Inner {
                 if let Some(Err(e)) = restored {
                     inner.emit_error(e);
                 }
-                if !channels.is_empty()
-                    && let Err(e) = Inner::send_subscribe(&inner, channels).await
-                {
-                    inner.emit_error(e);
+                let channels = {
+                    // futures.account waits for the next successful auth when this one failed.
+                    let mut s = inner.st.lock().unwrap();
+                    if s.auth_user_id.is_none()
+                        && s.channels.iter().any(|c| c == FUTURES_ACCOUNT_CHANNEL)
+                    {
+                        s.channels.retain(|c| c != FUTURES_ACCOUNT_CHANNEL);
+                        if !s
+                            .pending_private
+                            .iter()
+                            .any(|c| c == FUTURES_ACCOUNT_CHANNEL)
+                        {
+                            s.pending_private.push(FUTURES_ACCOUNT_CHANNEL.to_string());
+                        }
+                    }
+                    channels
+                        .into_iter()
+                        .filter(|c| s.channels.contains(c))
+                        .collect::<Vec<_>>()
+                };
+                if !channels.is_empty() {
+                    let out = Inner::subscribe_split(&inner, channels).await;
+                    for (c, w) in out.rejected {
+                        inner.refused(&c, &w);
+                        inner.emit_error(w.into());
+                    }
+                    if let Some(e) = out.error {
+                        inner.emit_error(e);
+                    }
                 }
             });
         }
@@ -1119,6 +1226,86 @@ impl Inner {
         payload.insert("signature".into(), Value::String(signature));
         let ack = Inner::request(this, "auth_key", payload, vec![], true).await?;
         Ok(auth_result(&ack))
+    }
+
+    /// Subscribes `channels`: every `futures.*` channel in a request of its own (the server sends
+    /// a refusal as an error frame that does not name the channel, before the one ack of the
+    /// request, and no ack when nothing was accepted), the others together. The frames are sent
+    /// in that order at once; the acknowledgements are awaited together.
+    async fn subscribe_split(this: &Arc<Inner>, channels: Vec<String>) -> SubscribeOutcome {
+        let (futures, batch): (Vec<String>, Vec<String>) = channels
+            .into_iter()
+            .partition(|c| c.starts_with("futures."));
+        let mut groups: Vec<Vec<String>> = vec![];
+        if !batch.is_empty() {
+            groups.push(batch.clone());
+        }
+        groups.extend(futures.into_iter().map(|c| vec![c]));
+        let results = futures_util::future::join_all(
+            groups
+                .iter()
+                .map(|g| Inner::send_subscribe(this, g.clone())),
+        )
+        .await;
+        let mut out = SubscribeOutcome {
+            batch: batch.clone(),
+            ..Default::default()
+        };
+        for (group, r) in groups.into_iter().zip(results) {
+            let single_futures = group.len() == 1 && group[0].starts_with("futures.");
+            match r {
+                Ok(added) => out.added.extend(added),
+                Err(Error::WebSocket(w)) if w.from_server && single_futures => {
+                    out.rejected.push((group[0].clone(), w));
+                }
+                Err(e) => {
+                    if out.error.is_none() {
+                        out.error = Some(e);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// The server refused to subscribe `channel` (sent alone): a private channel refused as
+    /// `UNAUTHENTICATED` waits for the next successful auth; anything else is no longer held.
+    fn refused(&self, channel: &str, err: &WsError) {
+        let mut s = self.st.lock().unwrap();
+        s.channels.retain(|c| c != channel);
+        if err.code == "UNAUTHENTICATED" && PRIVATE_CHANNELS.contains(&channel) {
+            if !s.pending_private.iter().any(|c| c == channel) {
+                s.pending_private.push(channel.to_string());
+            }
+        } else {
+            s.pending_private.retain(|c| c != channel);
+        }
+    }
+
+    /// `futures.resync` on `futures.account`: the server's updates for it stopped and a repeated
+    /// `subscribe` alone would be a no-op, so send `unsubscribe` then `subscribe` (in that order,
+    /// at once). A refused subscribe drops the channel and is reported.
+    fn resubscribe_account(this: &Arc<Inner>) {
+        let inner = this.clone();
+        tokio::spawn(async move {
+            let c = FUTURES_ACCOUNT_CHANNEL.to_string();
+            let mut payload = Map::new();
+            payload.insert("channels".into(), json!([c]));
+            let unsub = Inner::request(&inner, "unsubscribe", payload, vec![c.clone()], false);
+            let sub = Inner::send_subscribe(&inner, vec![c.clone()]);
+            let (u, r) = futures_util::future::join(unsub, sub).await;
+            if let Err(e) = u {
+                inner.emit_error(e);
+            }
+            match r {
+                Ok(_) => {}
+                Err(Error::WebSocket(w)) if w.from_server => {
+                    inner.refused(&c, &w);
+                    inner.emit_error(w.into());
+                }
+                Err(e) => inner.emit_error(e),
+            }
+        });
     }
 
     async fn send_subscribe(this: &Arc<Inner>, channels: Vec<String>) -> Result<Vec<String>> {
@@ -1438,6 +1625,16 @@ impl Inner {
                 {
                     Inner::track_seq(this, &ev.channel, n);
                 }
+                if ev.r#type == "futures.resync" {
+                    let channel = ev.channel.clone();
+                    this.emit(WsEvent::Event(ev));
+                    this.emit(WsEvent::ChannelResync(channel.clone()));
+                    let held = this.st.lock().unwrap().channels.contains(&channel);
+                    if channel == FUTURES_ACCOUNT_CHANNEL && held {
+                        Inner::resubscribe_account(this);
+                    }
+                    return;
+                }
                 let resync = match ev.r#type.as_str() {
                     "balances.resync" => Some(ResyncReason::BalancesResync),
                     "deposits.resync" => Some(ResyncReason::DepositsResync),
@@ -1668,13 +1865,18 @@ impl Inner {
         let inner = this.clone();
         let sent = channels.clone();
         tokio::spawn(async move {
-            if let Err(e) = Inner::send_subscribe(&inner, sent.clone()).await {
+            let out = Inner::subscribe_split(&inner, sent).await;
+            for (c, w) in out.rejected {
+                inner.refused(&c, &w);
+                inner.emit_error(w.into());
+            }
+            if let Some(e) = out.error {
                 if let Error::WebSocket(w) = &e
                     && w.from_server
                 {
                     // Refused by the server (e.g. signed out again meanwhile): back to pending.
                     let mut s = inner.st.lock().unwrap();
-                    for c in &sent {
+                    for c in &out.batch {
                         if let Some(i) = s.channels.iter().position(|x| x == c) {
                             s.channels.remove(i);
                             if !s.pending_private.contains(c) {

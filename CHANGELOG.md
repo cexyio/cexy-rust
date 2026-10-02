@@ -30,6 +30,36 @@ All notable changes to this project are documented here. The format follows
   busy) and `Error::PagingCursorRepeated` (code `PAGING_CURSOR_REPEATED`, not retryable: the server
   repeated a cursor after a page of rows). `PAGING_STALLED` and `PAGING_CURSOR_REPEATED` are exported;
   `Error::code()` returns the code of an API, WebSocket or paging error.
+- Futures WebSocket channels (conformance/ws/futures.json). `FuturesChannel` builds `futures.mids`,
+  `futures.orderbook:{coin}`, `futures.trades:{coin}`, `futures.candles:{coin}:{interval}`,
+  `futures.status` and `futures.account`, checking the coin (case-sensitive, 1 to 20 ASCII letters or
+  digits) and the interval (`FUTURES_INTERVALS`) locally: a bad one is an `Error::Config` and nothing is
+  sent; `subscribe` checks `futures.*` names the same way. The event types `futures.mids`,
+  `futures.orderbook.update`, `futures.trades.new`, `futures.candle.update`, `futures.status`,
+  `futures.positions`, `futures.orders` and `futures.resync` are delivered as `WsEvent::Event`, with
+  typed data: `FuturesMids`, `FuturesBookUpdate`, `FuturesTradesUpdate`, `FuturesCandleUpdate`,
+  `FuturesStatus`, `FuturesPositionsUpdate`, `FuturesOrdersUpdate`.
+- `futures.account` is a private channel (`PRIVATE_CHANNELS` has 6 entries; `FUTURES_ACCOUNT_CHANNEL`):
+  subscribed before `auth`/`auth_key` succeeds, it is held (`SubscribeResult::pending`,
+  `WebSocket::pending_channels`) and subscribed after the next successful auth; sign-outs end it like
+  the other private channels.
+- `WsEvent::ChannelResync(channel)` follows every `futures.resync` event: refetch that channel over
+  REST. On `futures.account` the client also sends `unsubscribe` then `subscribe` for it (the server's
+  updates stopped and a repeated subscribe alone does nothing); a refusal of that subscribe drops the
+  channel and is reported as `WsEvent::Error`.
+- Each `futures.*` channel is subscribed in a request of its own, because the server answers a
+  partly refused subscribe with error frames that do not name the channel, before the one
+  `subscribed` ack (and sends no ack when nothing was accepted). Refusals are in the new
+  `SubscribeResult::rejected` (the call fails when every channel sent was refused); they are not held
+  and not retried automatically (WebSocket errors carry no retry hint). The same applies to the
+  automatic re-subscription after a reconnect or a re-auth.
+- `MAX_PING_INTERVAL` (60 s): a longer `WsOptions::ping_interval` is lowered to it, since the server
+  closes connections whose client is silent for 90 to 120 s.
+
+### Changed
+- `PRIVATE_CHANNELS` is now `[&str; 6]` and `SubscribeResult` has two new public fields (`rejected`,
+  `pending`): code that names the array type or builds `SubscribeResult` with a full struct literal
+  must be updated.
 
 ## [0.1.0-dev.8] (2026-10-01)
 

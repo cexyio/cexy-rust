@@ -47,6 +47,15 @@ pub(super) struct Server {
 
 impl Server {
     pub(super) async fn start() -> Server {
+        Server::start_with(
+            json!({"type": "welcome", "protocol_version": 1, "heartbeat_interval_seconds": 30,
+                                  "max_subscriptions": 100, "connection_id": "c1"}),
+        )
+        .await
+    }
+
+    /// Like [`Server::start`], with this welcome frame.
+    pub(super) async fn start_with(welcome: Value) -> Server {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!(
             "ws://127.0.0.1:{}/api/v1/ws",
@@ -56,6 +65,7 @@ impl Server {
         tokio::spawn(async move {
             while let Ok((tcp, _)) = listener.accept().await {
                 let tx = tx.clone();
+                let welcome = welcome.clone();
                 tokio::spawn(async move {
                     let ua = Arc::new(Mutex::new(None));
                     let ua2 = ua.clone();
@@ -74,8 +84,6 @@ impl Server {
                     let (mut sink, mut read) = ws.split();
                     let (to_client, mut out) = mpsc::unbounded_channel::<Message>();
                     let (fc_tx, from_client) = mpsc::unbounded_channel();
-                    let welcome = json!({"type": "welcome", "protocol_version": 1, "heartbeat_interval_seconds": 30,
-                                         "max_subscriptions": 100, "connection_id": "c1"});
                     let _ = sink.send(Message::text(welcome.to_string())).await;
                     let user_agent = ua.lock().unwrap().clone();
                     let _ = tx.send(Conn {

@@ -14,5 +14,6 @@ mod redirect;
 mod signing;
 mod trading;
 mod ws;
+mod ws_futures;
 mod ws_live_balances;
 mod ws_signout;

@@ -37,6 +37,7 @@ mod signing;
 mod tls;
 mod transport;
 mod ws;
+mod ws_futures;
 
 pub use amount::{Amount, BookLevel, levels};
 pub use auth::{ApiKeyAuthenticator, AuthRequest, Authenticator};
@@ -65,9 +66,14 @@ pub use signing::{HmacAuthenticator, MAX_CLOCK_OFFSET, SIGNING_SCHEME};
 pub use transport::RetryInfo;
 pub use ws::{
     AuthChange, AuthChangeReason, AuthResult, BookEvent, CloseInfo, DEFAULT_WEBSOCKET_URL,
-    OrderBookUpdate, PRIVATE_CHANNELS, ResyncReason, SUPPORTED_PROTOCOL_VERSION, SequenceGap,
-    SessionRevoked, SubscribeResult, WebSocket, Welcome, WsClock, WsEvent, WsEvents, WsFrame,
-    WsOptions, WsTimer,
+    MAX_PING_INTERVAL, OrderBookUpdate, PRIVATE_CHANNELS, ResyncReason, SUPPORTED_PROTOCOL_VERSION,
+    SequenceGap, SessionRevoked, SubscribeResult, WebSocket, Welcome, WsClock, WsEvent, WsEvents,
+    WsFrame, WsOptions, WsTimer,
+};
+pub use ws_futures::{
+    FUTURES_ACCOUNT_CHANNEL, FUTURES_INTERVALS, FuturesBookUpdate, FuturesCandleUpdate,
+    FuturesChannel, FuturesMids, FuturesOrdersUpdate, FuturesPositionsUpdate, FuturesStatus,
+    FuturesTradesUpdate,
 };
 
 /// SDK version.

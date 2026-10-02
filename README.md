@@ -295,7 +295,8 @@ counted in `ws.dropped_events()`. Live order books keep updating either way (`bo
 
 What the client does for you:
 
-- Sends `{"op":"ping"}` every 30 s (required: the server closes idle connections) and accepts the server's
+- Sends `{"op":"ping"}` every 30 s, never less often than every 60 s (required: the server closes
+  connections whose client is silent for 90 s) and accepts the server's
   unsolicited pongs. No frame from the server for 75 s (`liveness_timeout`; the client's own pings do not
   count) means a dead connection and a reconnect.
 - Reconnects with exponential backoff and full jitter, then re-authenticates and re-subscribes everything.
@@ -320,7 +321,7 @@ While a snapshot is missing (for example, the REST call keeps failing), `LiveOrd
 the newest 256 updates to replay; older ones are dropped (`book.dropped_updates()`, with one
 `WsEvent::Warning`). Nothing is lost, since every update is a complete top 50.
 
-**Private channels** (`orders`, `balances`, `deposits`, `withdrawals`, `account`) need
+**Private channels** (`orders`, `balances`, `deposits`, `withdrawals`, `account`, `futures.account`) need
 `ws.auth(token)` with a session access token (it returns the `user_id` from `authenticated`),
 or `ws.auth_key()` with an API key (see
 [Request signing](#request-signing)). If the session is revoked, the client emits `WsEvent::AuthLost`;
@@ -345,6 +346,66 @@ skipped (after a short reorder window, `WsOptions::reorder_window`, default 250 
 `WsEvent::SequenceGap` and `WsEvent::Resync(ResyncReason::SequenceGap)`: refetch that channel's
 state over REST. `balances.resync`, `deposits.resync` and `withdrawals.resync` (the last two
 planned) emit `Resync` with `BalancesResync`, `DepositsResync` or `WithdrawalsResync`.
+
+### Futures channels
+
+Public: `futures.mids`, `futures.orderbook:{coin}`, `futures.trades:{coin}`,
+`futures.candles:{coin}:{interval}` and `futures.status`. Private: `futures.account` (positions and
+open orders, in full, on subscribe and on change). Build the names with `cexy::FuturesChannel`: the
+coin is sent exactly as given (case-sensitive, as `futures().markets()` lists it, 1 to 20 ASCII
+letters or digits) and the interval is one of `1m 5m 15m 1h 4h 1d`; anything else is an
+`Error::Config` and nothing is sent.
+
+```rust
+# async fn run(c: cexy::Client) -> cexy::Result<()> {
+use cexy::{FuturesBookUpdate, FuturesChannel, WsEvent, WsOptions};
+let ws = c.websocket(WsOptions::default())?;
+let mut events = ws.events().expect("taken once");
+ws.connect().await?;
+ws.auth_key().await?; // only futures.account needs it
+let book = FuturesChannel::orderbook("BTC")?;
+let candles = FuturesChannel::candles("BTC", "1m")?;
+let r = ws
+    .subscribe(&[&FuturesChannel::mids(), &book, &candles, &FuturesChannel::account()])
+    .await?;
+for (channel, err) in &r.rejected {
+    println!("{channel} refused: {}", err.code); // not retried automatically
+}
+// No snapshot on subscribe for public futures channels: seed them from REST.
+let mut bids = c.futures().order_book("BTC", None).await?.bids;
+while let Some(ev) = events.recv().await {
+    match ev {
+        WsEvent::Event(e) if e.r#type == "futures.orderbook.update" => {
+            bids = e.decode::<FuturesBookUpdate>()?.bids; // every frame is the complete book
+        }
+        WsEvent::ChannelResync(channel) => println!("refetch {channel} over REST"),
+        _ => {}
+    }
+}
+# let _ = bids; Ok(()) }
+```
+
+- Events are `WsEvent::Event` with `type` `futures.mids`, `futures.orderbook.update`,
+  `futures.trades.new`, `futures.candle.update`, `futures.status`, `futures.positions`,
+  `futures.orders` or `futures.resync`; decode `data` with `FuturesMids`, `FuturesBookUpdate`,
+  `FuturesTradesUpdate`, `FuturesCandleUpdate`, `FuturesStatus`, `FuturesPositionsUpdate` or
+  `FuturesOrdersUpdate`. Book levels are `{price, size}` objects; books, mids, positions and orders
+  are full replacements.
+- `futures.resync` arrives as its event, then `WsEvent::ChannelResync(channel)`: refetch that
+  channel over REST. On `futures.account` the client also sends `unsubscribe` then `subscribe` for
+  it (the server's updates stopped); if that subscribe is refused (for example `NOT_FOUND`, no
+  futures account) the channel is dropped and the error is reported (`WsEvent::Error`).
+- `futures.account` subscribed before `auth`/`auth_key` succeeds is held (`SubscribeResult::pending`,
+  `ws.pending_channels()`) and subscribed once it does; a sign-out ends it like the other private
+  channels.
+- Each `futures.*` channel is subscribed in a request of its own, so a refusal (`RATE_LIMITED`,
+  `NOT_FOUND`, `VALIDATION_FAILED`, `SERVICE_UNAVAILABLE`) names its channel. Refused channels are in
+  `SubscribeResult::rejected` (an error when every channel sent was refused), are not held and are
+  not retried: WebSocket error frames carry no retry hint, so back off yourself (about 60 s after
+  `RATE_LIMITED`).
+- Public futures sequences are not gap-checked (frames are full replacements, or lost for trades and
+  candles); `futures.account` is checked like the other private channels and restarts after a
+  re-subscribe.
 
 ### Request signing
 
