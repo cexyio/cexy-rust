@@ -20,6 +20,8 @@ pub enum OperationId {
     CancelAll,
     /// `cancel_order`
     CancelOrder,
+    /// `candles`
+    Candles,
     /// `deposit_address`
     DepositAddress,
     /// `exchange_config`
@@ -36,6 +38,10 @@ pub enum OperationId {
     ExportTrades,
     /// `export_withdrawals`
     ExportWithdrawals,
+    /// `fills`
+    Fills,
+    /// `funding`
+    Funding,
     /// `get_account_id`
     GetAccountId,
     /// `get_asset`
@@ -90,16 +96,28 @@ pub enum OperationId {
     ListWithdrawalAddresses,
     /// `list_withdrawals`
     ListWithdrawals,
+    /// `market`
+    Market,
+    /// `markets`
+    Markets,
+    /// `open_orders`
+    OpenOrders,
     /// `order_history`
     OrderHistory,
+    /// `orderbook`
+    Orderbook,
     /// `place_order`
     PlaceOrder,
+    /// `positions`
+    Positions,
     /// `server_time`
     ServerTime,
     /// `sub_account_balances`
     SubAccountBalances,
     /// `trade_history`
     TradeHistory,
+    /// `trades`
+    Trades,
 }
 
 /// Method, path, authentication and required API-key scope of an operation.
@@ -116,10 +134,11 @@ pub struct OperationInfo {
 }
 
 impl OperationId {
-    /// Every operation of the SDK surface (42).
-    pub const ALL: [OperationId; 42] = [
+    /// Every operation of the SDK surface (51).
+    pub const ALL: [OperationId; 51] = [
         OperationId::CancelAll,
         OperationId::CancelOrder,
+        OperationId::Candles,
         OperationId::DepositAddress,
         OperationId::ExchangeConfig,
         OperationId::ExitPool,
@@ -128,6 +147,8 @@ impl OperationId {
         OperationId::ExportOrders,
         OperationId::ExportTrades,
         OperationId::ExportWithdrawals,
+        OperationId::Fills,
+        OperationId::Funding,
         OperationId::GetAccountId,
         OperationId::GetAsset,
         OperationId::GetBalance,
@@ -155,11 +176,17 @@ impl OperationId {
         OperationId::ListSubAccounts,
         OperationId::ListWithdrawalAddresses,
         OperationId::ListWithdrawals,
+        OperationId::Market,
+        OperationId::Markets,
+        OperationId::OpenOrders,
         OperationId::OrderHistory,
+        OperationId::Orderbook,
         OperationId::PlaceOrder,
+        OperationId::Positions,
         OperationId::ServerTime,
         OperationId::SubAccountBalances,
         OperationId::TradeHistory,
+        OperationId::Trades,
     ];
 
     /// The API's operationId, such as `"place_order"`.
@@ -167,6 +194,7 @@ impl OperationId {
         match self {
             OperationId::CancelAll => "cancel_all",
             OperationId::CancelOrder => "cancel_order",
+            OperationId::Candles => "candles",
             OperationId::DepositAddress => "deposit_address",
             OperationId::ExchangeConfig => "exchange_config",
             OperationId::ExitPool => "exit_pool",
@@ -175,6 +203,8 @@ impl OperationId {
             OperationId::ExportOrders => "export_orders",
             OperationId::ExportTrades => "export_trades",
             OperationId::ExportWithdrawals => "export_withdrawals",
+            OperationId::Fills => "fills",
+            OperationId::Funding => "funding",
             OperationId::GetAccountId => "get_account_id",
             OperationId::GetAsset => "get_asset",
             OperationId::GetBalance => "get_balance",
@@ -202,11 +232,17 @@ impl OperationId {
             OperationId::ListSubAccounts => "list_sub_accounts",
             OperationId::ListWithdrawalAddresses => "list_withdrawal_addresses",
             OperationId::ListWithdrawals => "list_withdrawals",
+            OperationId::Market => "market",
+            OperationId::Markets => "markets",
+            OperationId::OpenOrders => "open_orders",
             OperationId::OrderHistory => "order_history",
+            OperationId::Orderbook => "orderbook",
             OperationId::PlaceOrder => "place_order",
+            OperationId::Positions => "positions",
             OperationId::ServerTime => "server_time",
             OperationId::SubAccountBalances => "sub_account_balances",
             OperationId::TradeHistory => "trade_history",
+            OperationId::Trades => "trades",
         }
     }
 
@@ -224,6 +260,12 @@ impl OperationId {
                 path: "/api/v1/trading/orders/{order_id}",
                 auth: "api_key",
                 scope: "trade",
+            },
+            OperationId::Candles => OperationInfo {
+                method: "GET",
+                path: "/api/v1/futures/markets/{coin}/candles",
+                auth: "none",
+                scope: "",
             },
             OperationId::DepositAddress => OperationInfo {
                 method: "GET",
@@ -270,6 +312,18 @@ impl OperationId {
             OperationId::ExportWithdrawals => OperationInfo {
                 method: "GET",
                 path: "/api/v1/exports/withdrawals",
+                auth: "api_key",
+                scope: "read",
+            },
+            OperationId::Fills => OperationInfo {
+                method: "GET",
+                path: "/api/v1/futures/fills",
+                auth: "api_key",
+                scope: "read",
+            },
+            OperationId::Funding => OperationInfo {
+                method: "GET",
+                path: "/api/v1/futures/funding",
                 auth: "api_key",
                 scope: "read",
             },
@@ -435,17 +489,47 @@ impl OperationId {
                 auth: "api_key",
                 scope: "read",
             },
+            OperationId::Market => OperationInfo {
+                method: "GET",
+                path: "/api/v1/futures/markets/{coin}",
+                auth: "none",
+                scope: "",
+            },
+            OperationId::Markets => OperationInfo {
+                method: "GET",
+                path: "/api/v1/futures/markets",
+                auth: "none",
+                scope: "",
+            },
+            OperationId::OpenOrders => OperationInfo {
+                method: "GET",
+                path: "/api/v1/futures/orders",
+                auth: "api_key",
+                scope: "read",
+            },
             OperationId::OrderHistory => OperationInfo {
                 method: "GET",
                 path: "/api/v1/trading/orders/history",
                 auth: "api_key",
                 scope: "read",
             },
+            OperationId::Orderbook => OperationInfo {
+                method: "GET",
+                path: "/api/v1/futures/markets/{coin}/orderbook",
+                auth: "none",
+                scope: "",
+            },
             OperationId::PlaceOrder => OperationInfo {
                 method: "POST",
                 path: "/api/v1/trading/orders",
                 auth: "api_key",
                 scope: "trade",
+            },
+            OperationId::Positions => OperationInfo {
+                method: "GET",
+                path: "/api/v1/futures/positions",
+                auth: "api_key",
+                scope: "read",
             },
             OperationId::ServerTime => OperationInfo {
                 method: "GET",
@@ -465,7 +549,46 @@ impl OperationId {
                 auth: "api_key",
                 scope: "read",
             },
+            OperationId::Trades => OperationInfo {
+                method: "GET",
+                path: "/api/v1/futures/markets/{coin}/trades",
+                auth: "none",
+                scope: "",
+            },
         }
+    }
+}
+
+/// Query parameters of `candles`. `None` is not sent.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct CandlesParams {
+    /// `1m`, `5m`, `15m`, `1h`, `4h` or `1d`.
+    ///
+    /// Required.
+    pub interval: String,
+    /// Unix milliseconds: the window of 500 candles holding this time. Absent: the latest 500.
+    pub before: Option<i64>,
+}
+
+impl CandlesParams {
+    /// Parameters with the required values; the optional ones are unset.
+    pub fn new(interval: impl Into<String>) -> Self {
+        Self {
+            interval: interval.into(),
+            before: None,
+        }
+    }
+
+    pub(crate) fn query(&self) -> Vec<(&'static str, String)> {
+        let mut q = Vec::new();
+        {
+            let v = &self.interval;
+            q.push(("interval", v.clone()));
+        }
+        if let Some(v) = &self.before {
+            q.push(("before", v.to_string()));
+        }
+        q
     }
 }
 
@@ -522,6 +645,40 @@ impl ExportParams {
         }
         if let Some(v) = &self.to {
             q.push(("to", v.to_rfc3339_opts(SecondsFormat::AutoSi, true)));
+        }
+        q
+    }
+}
+
+/// Query parameters of `fills`. `None` is not sent.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct FillsParams {
+    /// The `next_cursor` of the previous page, as given; absent for the newest. A unix time in milliseconds is also accepted: rows older than it.
+    pub cursor: Option<String>,
+}
+
+impl FillsParams {
+    pub(crate) fn query(&self) -> Vec<(&'static str, String)> {
+        let mut q = Vec::new();
+        if let Some(v) = &self.cursor {
+            q.push(("cursor", v.clone()));
+        }
+        q
+    }
+}
+
+/// Query parameters of `funding`. `None` is not sent.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct FundingParams {
+    /// The `next_cursor` of the previous page, as given; absent for the newest. A unix time in milliseconds is also accepted: rows older than it.
+    pub cursor: Option<String>,
+}
+
+impl FundingParams {
+    pub(crate) fn query(&self) -> Vec<(&'static str, String)> {
+        let mut q = Vec::new();
+        if let Some(v) = &self.cursor {
+            q.push(("cursor", v.clone()));
         }
         q
     }
@@ -803,6 +960,23 @@ impl OrderHistoryParams {
     }
 }
 
+/// Query parameters of `orderbook`. `None` is not sent.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct OrderbookParams {
+    /// Levels per side, 1 to 20 (default 20).
+    pub depth: Option<i64>,
+}
+
+impl OrderbookParams {
+    pub(crate) fn query(&self) -> Vec<(&'static str, String)> {
+        let mut q = Vec::new();
+        if let Some(v) = &self.depth {
+            q.push(("depth", v.to_string()));
+        }
+        q
+    }
+}
+
 /// Query parameters of `trade_history`. `None` is not sent.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct TradeHistoryParams {
@@ -830,6 +1004,23 @@ impl TradeHistoryParams {
         }
         if let Some(v) = &self.direction {
             q.push(("direction", v.as_str().to_string()));
+        }
+        q
+    }
+}
+
+/// Query parameters of `trades`. `None` is not sent.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct TradesParams {
+    /// 1 to 100 (default 50).
+    pub limit: Option<i64>,
+}
+
+impl TradesParams {
+    pub(crate) fn query(&self) -> Vec<(&'static str, String)> {
+        let mut q = Vec::new();
+        if let Some(v) = &self.limit {
+            q.push(("limit", v.to_string()));
         }
         q
     }

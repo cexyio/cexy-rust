@@ -12,7 +12,9 @@ use crate::error::{Error, Result};
 use crate::limiter::{RateLimitState, RateLimiter};
 use crate::models_gen::{ExchangeConfig, ServerTime};
 use crate::operations_gen::OperationId;
-use crate::services::{Account, Assets, Exports, Fees, Markets, Networks, Pools, Trading, Wallet};
+use crate::services::{
+    Account, Assets, Exports, Fees, Futures, Markets, Networks, Pools, Trading, Wallet,
+};
 use crate::signing::HmacAuthenticator;
 use crate::transport::{
     Call, Random, Resolved, RetryHook, RetryInfo, Transport, decode_data, origin,
@@ -317,6 +319,14 @@ impl Client {
     /// Orders and your trades. Placing and cancelling need the trade scope.
     pub fn trading(&self) -> Trading<'_> {
         Trading { c: self }
+    }
+
+    /// Futures market data (public) and the account's own futures data (read scope). Read only.
+    pub fn futures(&self) -> Futures<'_> {
+        Futures {
+            c: self,
+            max_busy_retries: crate::services::DEFAULT_MAX_BUSY_RETRIES,
+        }
     }
 
     pub(crate) async fn get<T: serde::de::DeserializeOwned>(&self, c: Call) -> Result<T> {

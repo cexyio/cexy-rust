@@ -70,7 +70,45 @@ pub enum Error {
     /// A response that could not be decoded.
     #[error("cexy: {0}")]
     Decode(String),
+
+    /// An iterate-all helper ([`crate::Futures::all_fills`], [`crate::Futures::all_funding`])
+    /// kept getting an empty page whose `next_cursor` was the cursor it had sent: the server's
+    /// data source is busy. It waited and asked again `retries` times (see
+    /// [`crate::Futures::with_max_busy_retries`]), then gave up. Code [`PAGING_STALLED`], a local
+    /// error (never sent by the server). Retryable: page again later from `cursor`. The rows
+    /// yielded before it are NOT the complete history.
+    #[error(
+        "cexy: [{PAGING_STALLED}] {operation}: still no rows after {retries} retries of the same cursor; page again later"
+    )]
+    PagingStalled {
+        /// The listing operation, such as `"fills"`.
+        operation: &'static str,
+        /// The cursor that stalled, exactly as the server gave it (opaque).
+        cursor: String,
+        /// How many times the same cursor was asked again.
+        retries: u32,
+    },
+
+    /// An iterate-all helper got a page WITH rows whose `next_cursor` was the cursor it had just
+    /// sent: following it would repeat that page forever. The rows of that page were yielded, then
+    /// this. Code [`PAGING_CURSOR_REPEATED`], a local error; not retryable. The rows yielded
+    /// before it are NOT the complete history.
+    #[error(
+        "cexy: [{PAGING_CURSOR_REPEATED}] {operation}: the server repeated a cursor after a page of rows; paging stopped"
+    )]
+    PagingCursorRepeated {
+        /// The listing operation, such as `"fills"`.
+        operation: &'static str,
+        /// The repeated cursor, exactly as the server gave it (opaque).
+        cursor: String,
+    },
 }
+
+/// The code of [`Error::PagingStalled`].
+pub const PAGING_STALLED: &str = "PAGING_STALLED";
+
+/// The code of [`Error::PagingCursorRepeated`].
+pub const PAGING_CURSOR_REPEATED: &str = "PAGING_CURSOR_REPEATED";
 
 impl Error {
     /// The API error, if this is one.
@@ -86,15 +124,27 @@ impl Error {
         self.api().is_some_and(|e| e.is(category))
     }
 
-    /// Whether an identical retry could succeed: a connection failure, or an API error marked
-    /// retryable (including 409 `CONCURRENT_MODIFICATION`). A 4xx is never retryable except 429
+    /// The machine-readable code: the API error's code, a WebSocket error's code, or
+    /// [`PAGING_STALLED`] / [`PAGING_CURSOR_REPEATED`]. `None` for the other local errors.
+    pub fn code(&self) -> Option<&str> {
+        match self {
+            Error::Api(e) => Some(e.code.as_str()),
+            Error::WebSocket(e) => Some(&e.code),
+            Error::PagingStalled { .. } => Some(PAGING_STALLED),
+            Error::PagingCursorRepeated { .. } => Some(PAGING_CURSOR_REPEATED),
+            _ => None,
+        }
+    }
+
+    /// Whether an identical retry could succeed: a connection failure, [`Error::PagingStalled`],
+    /// or an API error marked retryable (including 409 `CONCURRENT_MODIFICATION`). A 4xx is never retryable except 429
     /// and 409 `CONCURRENT_MODIFICATION`, whatever its body says.
     ///
     /// An error whose server wait (Retry-After) exceeds [`MAX_SERVER_WAIT`] is not retryable:
     /// the SDK fails fast instead of waiting that long. `retry_after` still carries the value.
     pub fn is_retryable(&self) -> bool {
         match self {
-            Error::Connection(_) => true,
+            Error::Connection(_) | Error::PagingStalled { .. } => true,
             Error::Api(e) => {
                 e.retryable_ignoring_wait() && e.retry_after.is_none_or(|d| d <= MAX_SERVER_WAIT)
             }

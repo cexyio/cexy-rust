@@ -5,7 +5,7 @@ use crate::client::Client;
 use crate::error::{Error, ErrorCategory, Result};
 use crate::models_gen::*;
 use crate::operations_gen::*;
-use crate::pagination::{ItemStream, Page, paginate};
+use crate::pagination::{HistoryPage, ItemStream, Page, paginate, paginate_history};
 use crate::transport::{Call, decode, decode_data, new_id};
 
 fn q<P>(
@@ -687,12 +687,199 @@ fn cancel_all_call(symbol: Option<&str>) -> Result<Call> {
     Ok(call)
 }
 
+// ---------------------------------------------------------------------------------------
+// Futures data (read only)
+// ---------------------------------------------------------------------------------------
+
+/// Futures market data (public) and the account's own futures data (API key with the read
+/// scope). Read only: nothing here places orders or moves funds.
+///
+/// Every market-data answer carries `as_of` and `stale`. When nothing usable is cached and the
+/// provider cannot be read, the answer is 503 `SERVICE_UNAVAILABLE` (retryable, with
+/// Retry-After), retried by the normal retry policy. Without a futures account, the account
+/// reads answer `has_account: false`.
+#[derive(Clone, Copy)]
+pub struct Futures<'a> {
+    pub(crate) c: &'a Client,
+    pub(crate) max_busy_retries: u32,
+}
+
+/// How many times [`Futures::all_fills`] and [`Futures::all_funding`] ask again for the same
+/// cursor while the provider is busy, unless [`Futures::with_max_busy_retries`] says otherwise.
+pub const DEFAULT_MAX_BUSY_RETRIES: u32 = 3;
+
+impl<'a> Futures<'a> {
+    /// The same service, with `n` busy retries for [`Futures::all_fills`] and
+    /// [`Futures::all_funding`] (default [`DEFAULT_MAX_BUSY_RETRIES`]). It is a setting of its
+    /// own: the client's `max_retries` (request retries) does not change it, so a client with
+    /// retries disabled still rides out a busy provider.
+    pub fn with_max_busy_retries(self, n: u32) -> Futures<'a> {
+        Futures {
+            max_busy_retries: n,
+            ..self
+        }
+    }
+
+    /// Every listed futures market and its current figures.
+    pub async fn markets(&self) -> Result<FuturesMarkets> {
+        self.c.get(Call::new(OperationId::Markets)).await
+    }
+
+    /// One futures market, by the provider's coin name, such as `"BTC"`.
+    pub async fn market(&self, coin: &str) -> Result<FuturesMarket> {
+        self.c
+            .get(Call::new(OperationId::Market).path("coin", coin))
+            .await
+    }
+
+    /// A market's book, `depth` levels a side (1 to 20; `None`: the server's default, 20).
+    /// `stale` is the live feed's health, not the book's age.
+    pub async fn order_book(&self, coin: &str, depth: Option<u32>) -> Result<FuturesBook> {
+        let p = OrderbookParams {
+            depth: depth.map(i64::from),
+        };
+        self.c
+            .get(
+                Call::new(OperationId::Orderbook)
+                    .path("coin", coin)
+                    .query(p.query()),
+            )
+            .await
+    }
+
+    /// 500 candles: the latest, or the window holding `params.before`.
+    pub async fn candles(&self, coin: &str, params: &CandlesParams) -> Result<FuturesCandles> {
+        self.c
+            .get(
+                Call::new(OperationId::Candles)
+                    .path("coin", coin)
+                    .query(params.query()),
+            )
+            .await
+    }
+
+    /// Recent public trades, newest first: `limit` of them (1 to 100; `None`: the server's
+    /// default, 50).
+    pub async fn trades(&self, coin: &str, limit: Option<u32>) -> Result<FuturesTrades> {
+        let p = TradesParams {
+            limit: limit.map(i64::from),
+        };
+        self.c
+            .get(
+                Call::new(OperationId::Trades)
+                    .path("coin", coin)
+                    .query(p.query()),
+            )
+            .await
+    }
+
+    /// The account's margin summary and open positions.
+    pub async fn positions(&self) -> Result<FuturesPositions> {
+        self.c.get(Call::new(OperationId::Positions)).await
+    }
+
+    /// The account's open futures orders.
+    pub async fn open_orders(&self) -> Result<FuturesOpenOrders> {
+        self.c.get(Call::new(OperationId::OpenOrders)).await
+    }
+
+    /// One page of the account's fills, newest first (30 days back). `cursor` is the previous
+    /// page's `next_cursor`, passed back exactly as given (it is opaque); `None` for the newest.
+    /// A page can be short, even empty, and still have a `next_cursor`: keep paging until it is
+    /// `None`, or use [`Futures::all_fills`].
+    pub async fn fills(&self, cursor: Option<&str>) -> Result<FuturesFills> {
+        let p = FillsParams {
+            cursor: cursor.map(str::to_string),
+        };
+        self.c
+            .get(Call::new(OperationId::Fills).query(p.query()))
+            .await
+    }
+
+    /// One page of the account's funding payments, newest first; paged like [`Futures::fills`].
+    pub async fn funding(&self, cursor: Option<&str>) -> Result<FuturesFunding> {
+        let p = FundingParams {
+            cursor: cursor.map(str::to_string),
+        };
+        self.c
+            .get(Call::new(OperationId::Funding).query(p.query()))
+            .await
+    }
+
+    /// Every fill (30 days back), newest first, paging until `next_cursor` is `None`.
+    ///
+    /// An empty page whose `next_cursor` is the cursor just sent means the provider is busy: the
+    /// SDK waits (its retry backoff) and asks again with the same cursor, at most 3 times in a row
+    /// ([`Futures::with_max_busy_retries`]), then yields [`Error::PagingStalled`] (retryable; the rows
+    /// before it are not the whole history). A page with rows whose `next_cursor` is the cursor just
+    /// sent yields its rows, then [`Error::PagingCursorRepeated`] (not retryable). Without a futures
+    /// account the stream is empty. `max_items` stops the stream after that many items in total.
+    pub fn all_fills(&self, max_items: Option<usize>) -> ItemStream<'a, FuturesFill> {
+        let this = *self;
+        self.all(OperationId::Fills, max_items, move |cursor| async move {
+            let p = this.fills(cursor.as_deref()).await?;
+            Ok(HistoryPage {
+                rows: p.fills,
+                has_account: p.has_account,
+                next_cursor: p.next_cursor,
+            })
+        })
+    }
+
+    /// Every funding payment (30 days back), newest first; see [`Futures::all_fills`].
+    pub fn all_funding(&self, max_items: Option<usize>) -> ItemStream<'a, Funding> {
+        let this = *self;
+        self.all(OperationId::Funding, max_items, move |cursor| async move {
+            let p = this.funding(cursor.as_deref()).await?;
+            Ok(HistoryPage {
+                rows: p.funding,
+                has_account: p.has_account,
+                next_cursor: p.next_cursor,
+            })
+        })
+    }
+
+    fn all<T, F, Fut>(
+        &self,
+        op: OperationId,
+        max_items: Option<usize>,
+        fetch: F,
+    ) -> ItemStream<'a, T>
+    where
+        T: Send + 'a,
+        F: FnMut(Option<String>) -> Fut + Send + 'a,
+        Fut: std::future::Future<Output = Result<HistoryPage<T>>> + Send + 'a,
+    {
+        let c = self.c;
+        paginate_history(
+            op.as_str(),
+            self.max_busy_retries,
+            max_items,
+            fetch,
+            move |attempt, cause| async move { c.t.backoff(op, attempt, &cause, None).await },
+        )
+    }
+}
+
 /// A copy of an error for wrapping (errors hold no resources).
 pub(crate) fn clone_error(e: &Error) -> Error {
     match e {
         Error::Api(a) => Error::Api(a.clone()),
         Error::Connection(c) => Error::Connection(c.clone()),
         Error::WebSocket(w) => Error::WebSocket(w.clone()),
+        Error::PagingStalled {
+            operation,
+            cursor,
+            retries,
+        } => Error::PagingStalled {
+            operation,
+            cursor: cursor.clone(),
+            retries: *retries,
+        },
+        Error::PagingCursorRepeated { operation, cursor } => Error::PagingCursorRepeated {
+            operation,
+            cursor: cursor.clone(),
+        },
         other => Error::Decode(other.to_string()),
     }
 }

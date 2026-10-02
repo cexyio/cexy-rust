@@ -6,6 +6,85 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-dev.9] (2026-10-02)
+
+### Added
+- Futures data, read only: `Client::futures()` returns `Futures`, with the market data (public)
+  `markets`, `market(coin)`, `order_book(coin, depth)`, `candles(coin, &CandlesParams)` and
+  `trades(coin, limit)`, and the account's own data (API key with the `read` scope, signed)
+  `positions`, `open_orders`, `fills(cursor)` and `funding(cursor)`. The 9 operations and their
+  models come from the spec (`FuturesMarkets`, `FuturesMarket`, `PerpMarket`, `FuturesBook`, `Level`,
+  `FuturesCandles`, `FuturesTrades`, `FuturesPositions`, `Positions`, `Position`,
+  `FuturesOpenOrders`, `OpenOrder`, `FuturesFills`, `FuturesFunding`, `Funding`). The spec's futures
+  `Candle`, `Fill` and `PublicTrade` are generated as `FuturesCandle`, `FuturesFill` and
+  `FuturesPublicTrade`: the bare names are the spot models'.
+- `Futures::all_fills` and `Futures::all_funding` stream the whole history (30 days back), following
+  conformance/futures/history_paging.json: the opaque cursor is sent back verbatim (RFC 3986 in the
+  query), short and empty pages are followed until `next_cursor` is null, an empty page that repeats
+  the cursor just sent (the provider is busy) is retried with the same cursor after the retry backoff
+  at most `max_busy_retries` times (`DEFAULT_MAX_BUSY_RETRIES`, 3; `Futures::with_max_busy_retries`
+  changes it, independently of the client's `max_retries`), a page with rows whose `next_cursor` is
+  the cursor just sent (the spec's rule) yields its rows and then stops, and `has_account: false` yields nothing.
+- Local paging errors that end those streams; the rows before them are not the whole history, and
+  both carry the cursor: `Error::PagingStalled` (code `PAGING_STALLED`, retryable: the provider stayed
+  busy) and `Error::PagingCursorRepeated` (code `PAGING_CURSOR_REPEATED`, not retryable: the server
+  repeated a cursor after a page of rows). `PAGING_STALLED` and `PAGING_CURSOR_REPEATED` are exported;
+  `Error::code()` returns the code of an API, WebSocket or paging error.
+- Futures WebSocket channels (conformance/ws/futures.json). `FuturesChannel` builds `futures.mids`,
+  `futures.orderbook:{coin}`, `futures.trades:{coin}`, `futures.candles:{coin}:{interval}`,
+  `futures.status` and `futures.account`, checking the coin (case-sensitive, 1 to 20 ASCII letters or
+  digits) and the interval (`FUTURES_INTERVALS`) locally: a bad one is an `Error::Config` and nothing is
+  sent; `subscribe` checks `futures.*` names the same way. The event types `futures.mids`,
+  `futures.orderbook.update`, `futures.trades.new`, `futures.candle.update`, `futures.status`,
+  `futures.positions`, `futures.orders` and `futures.resync` are delivered as `WsEvent::Event`, with
+  typed data: `FuturesMids`, `FuturesBookUpdate`, `FuturesTradesUpdate`, `FuturesCandleUpdate`,
+  `FuturesStatus`, `FuturesPositionsUpdate`, `FuturesOrdersUpdate`.
+- `futures.account` is a private channel (`PRIVATE_CHANNELS` has 6 entries; `FUTURES_ACCOUNT_CHANNEL`):
+  subscribed before `auth`/`auth_key` succeeds, it is held (`SubscribeResult::pending`,
+  `WebSocket::pending_channels`) and subscribed after the next successful auth; sign-outs end it like
+  the other private channels.
+- `WsEvent::ChannelResync(channel)` follows every `futures.resync` event: refetch that channel over
+  REST. On `futures.account` the client also sends `unsubscribe` then `subscribe` for it (the server's
+  updates stopped and a repeated subscribe alone does nothing); a refusal of that subscribe drops the
+  channel and is reported as `WsEvent::Error`.
+- `SubscribeResult::rejected`: the channels the server refused, each with its error (see Fixed).
+- `MAX_PING_INTERVAL` (60 s): a longer `WsOptions::ping_interval` is an `Error::Config` when the
+  WebSocket is built, since the server closes connections whose client is silent for 90 to 120 s.
+
+### Changed
+- `PRIVATE_CHANNELS` is now `[&str; 6]` and `SubscribeResult` has two new public fields (`rejected`,
+  `pending`): code that names the array type or builds `SubscribeResult` with a full struct literal
+  must be updated.
+- `subscribe` with neither an ack nor an error within `ack_timeout` now fails with a local `TIMEOUT`
+  error (it used to succeed with nothing added). The channels stay held, so a reconnect sends them
+  again.
+
+### Fixed
+- A partly refused subscribe (spot or futures). The server answers it with one error frame per
+  refused channel, carrying the request id but not the channel, BEFORE its single `subscribed` ack,
+  and sends no ack when it refused every channel. The client failed the whole request on the first
+  error frame and stopped holding every channel in it. It now collects the error frames: the request
+  completes on the ack, or once every channel was refused, or at `ack_timeout` (with at least one
+  error: all refused). `subscribe` returns the accepted channels in `added` and the refused ones,
+  paired with the errors in the order sent (spot names compared as the server canonicalises them:
+  the market uppercased, with `_` as `/`, so `ticker:btc_usdt` matches `ticker:BTC/USDT`; futures names exactly; when there are fewer errors than refused channels, after
+  the server's 100-subscription stop, the last error covers the rest), in `rejected`; it fails only when every channel sent was
+  refused (or on a disconnect). Refused channels are not held and not retried. A subscribe is still
+  one frame.
+- The automatic re-subscription after a reconnect or a re-auth sorts refusals the same way: a
+  private channel refused as `UNAUTHENTICATED` waits for the next successful auth; any other refusal
+  drops the channel and is reported as `WsEvent::Error`.
+- Subscribe ack matching (conformance/ws/subscribe_refusals.json, spec ace4a5e): the channel kind
+  matched ignoring case, so `Ticker:BTC/USDT` (refused `VALIDATION_FAILED` by the server) could take
+  the ack of `ticker:BTC/USDT`. Kinds now match exactly; only the spot market symbol is
+  canonicalised (trimmed, uppercased, `_` as `/`), and the whole name is trimmed. Ack names are
+  matched as a multiset (the ack can repeat a name). `subscribe` sends two spellings of one channel
+  once, and reports a channel already held under another spelling in `already_subscribed`.
+- An accepted channel is now held, and re-sent after a reconnect, under the server's canonical name
+  from the ack (spec 6cea8f0, rule 13): `ticker:btc_usdt` is held as `ticker:BTC/USDT`, so held
+  names match event channels. `unsubscribe` takes any spelling of a held channel and sends the held
+  name.
+
 ## [0.1.0-dev.8] (2026-10-01)
 
 ### Changed

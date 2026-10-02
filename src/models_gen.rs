@@ -212,6 +212,27 @@ pub struct CancelFailure {
     pub order_id: String,
 }
 
+/// One candle.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FuturesCandle {
+    /// `close`
+    pub close: Amount,
+    /// Close time, unix milliseconds.
+    pub close_time: i64,
+    /// `high`
+    pub high: Amount,
+    /// `low`
+    pub low: Amount,
+    /// `open`
+    pub open: Amount,
+    /// Open time, unix milliseconds.
+    pub open_time: i64,
+    /// Number of trades.
+    pub trades: i64,
+    /// `volume`
+    pub volume: Amount,
+}
+
 open_enum! {
     /// Candle/kline intervals for market data.
     ///
@@ -475,6 +496,31 @@ pub struct FeeSchedule {
     pub tier: i32,
 }
 
+/// One fill.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FuturesFill {
+    /// `closed_pnl`
+    pub closed_pnl: Amount,
+    /// Coin.
+    pub coin: String,
+    /// The provider's description of the fill's effect (`Open Long`, `Close Short`, ...).
+    pub direction: String,
+    /// Our id for it.
+    pub id: String,
+    /// Our id for its order.
+    pub order_id: String,
+    /// `price`
+    pub price: Amount,
+    /// `buy` or `sell`.
+    pub side: String,
+    /// `size`
+    pub size: Amount,
+    /// Whether this fill took liquidity.
+    pub taker: bool,
+    /// When, unix milliseconds.
+    pub time: i64,
+}
+
 /// One of the caller's executions.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Fill {
@@ -500,6 +546,145 @@ pub struct Fill {
     pub timestamp: DateTime<Utc>,
     /// Trade id.
     pub trade_id: String,
+}
+
+/// One funding payment.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Funding {
+    /// `amount`
+    pub amount: Amount,
+    /// Coin.
+    pub coin: String,
+    /// `position_size`
+    pub position_size: Amount,
+    /// `rate`
+    pub rate: Amount,
+    /// When, unix milliseconds.
+    pub time: i64,
+}
+
+/// A futures market's book.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FuturesBook {
+    /// When the provider last sent it.
+    pub as_of: DateTime<Utc>,
+    /// Asks, best first.
+    #[serde(default)]
+    pub asks: Vec<Level>,
+    /// Bids, best first.
+    #[serde(default)]
+    pub bids: Vec<Level>,
+    /// Coin.
+    pub coin: String,
+    /// The live feed is not healthy: the book may be out of date.
+    pub stale: bool,
+}
+
+/// A futures market's candles.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FuturesCandles {
+    /// When read.
+    pub as_of: DateTime<Utc>,
+    /// Candles, oldest first.
+    #[serde(default)]
+    pub candles: Vec<FuturesCandle>,
+    /// Coin.
+    pub coin: String,
+    /// Interval.
+    pub interval: String,
+    /// Older than it should be.
+    pub stale: bool,
+}
+
+/// A page of the account's fills.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FuturesFills {
+    /// Newest first; fills sharing a millisecond in a fixed order. A page may be short of 100 and still be followed by more.
+    #[serde(default)]
+    pub fills: Vec<FuturesFill>,
+    /// Whether the account has a futures account.
+    pub has_account: bool,
+    /// Pass as `cursor` for older fills, exactly as given; `null` at the end (30 days back). Opaque: it may carry more than a time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+/// A page of the account's funding payments.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FuturesFunding {
+    /// Newest first.
+    #[serde(default)]
+    pub funding: Vec<Funding>,
+    /// Whether the account has a futures account.
+    pub has_account: bool,
+    /// Pass as `cursor` for older payments, exactly as given; `null` at the end (30 days back). Opaque.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+/// One futures market.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FuturesMarket {
+    /// When this data was read.
+    pub as_of: DateTime<Utc>,
+    /// `market`
+    pub market: PerpMarket,
+    /// Older than it should be.
+    pub stale: bool,
+}
+
+/// Every listed futures market.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FuturesMarkets {
+    /// When this data was read from the futures provider.
+    pub as_of: DateTime<Utc>,
+    /// The markets, in the provider's order. Delisted markets are not included.
+    #[serde(default)]
+    pub markets: Vec<PerpMarket>,
+    /// The data is older than it should be: the provider could not be read just now.
+    pub stale: bool,
+}
+
+/// The account's open orders.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FuturesOpenOrders {
+    /// When read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub as_of: Option<DateTime<Utc>>,
+    /// Whether the account has a futures account.
+    pub has_account: bool,
+    /// The open orders.
+    #[serde(default)]
+    pub orders: Vec<OpenOrder>,
+    /// Older than it should be.
+    pub stale: bool,
+}
+
+/// The account's positions.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FuturesPositions {
+    /// When read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub as_of: Option<DateTime<Utc>>,
+    /// Whether the account has a futures account. Without one, nothing else is meaningful.
+    pub has_account: bool,
+    /// `positions`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub positions: Option<Positions>,
+    /// Older than it should be.
+    pub stale: bool,
+}
+
+/// A futures market's recent public trades.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FuturesTrades {
+    /// Coin.
+    pub coin: String,
+    /// The live feed is not healthy, or was only just opened: trades may be missing.
+    pub stale: bool,
+    /// Newest first.
+    #[serde(default)]
+    pub trades: Vec<FuturesPublicTrade>,
 }
 
 /// Unique identifier of a futures collateral transfer.
@@ -813,6 +998,15 @@ impl Serialize for LedgerReference {
     }
 }
 
+/// One price level.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Level {
+    /// `price`
+    pub price: Amount,
+    /// `size`
+    pub size: Amount,
+}
+
 open_enum! {
     /// Whether a fill added liquidity (maker) or removed it (taker).
     ///
@@ -989,6 +1183,32 @@ pub struct Notification {
     pub title: String,
 }
 
+/// One open order.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OpenOrder {
+    /// Coin.
+    pub coin: String,
+    /// Our id for it, stable across reads.
+    pub id: String,
+    /// The order type as the provider names it (`Limit`, `Stop Market`, ...).
+    pub order_type: String,
+    /// `original_size`
+    pub original_size: Amount,
+    /// When placed, unix milliseconds.
+    pub placed_at: i64,
+    /// `price`
+    pub price: Amount,
+    /// Whether it may only reduce a position.
+    pub reduce_only: bool,
+    /// `buy` or `sell`.
+    pub side: String,
+    /// `size`
+    pub size: Amount,
+    /// `trigger_price`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger_price: Option<Amount>,
+}
+
 /// One side of the order book, aggregated by price.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OrderBook {
@@ -1125,6 +1345,32 @@ pub struct PasswordRules {
     pub min_length: i64,
 }
 
+/// One listed perpetual market and its current figures.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PerpMarket {
+    /// The provider's coin name, e.g. `BTC` or `kPEPE`.
+    pub coin: String,
+    /// `funding_rate`
+    pub funding_rate: Amount,
+    /// `mark_price`
+    pub mark_price: Amount,
+    /// The highest leverage allowed.
+    pub max_leverage: i32,
+    /// `mid_price`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mid_price: Option<Amount>,
+    /// `open_interest`
+    pub open_interest: Amount,
+    /// `oracle_price`
+    pub oracle_price: Amount,
+    /// `price_24h_ago`
+    pub price_24h_ago: Amount,
+    /// Decimal places a size may have.
+    pub size_decimals: i32,
+    /// `volume_24h`
+    pub volume_24h: Amount,
+}
+
 /// Places an order.
 ///
 /// Set `client_order_id` to make a retry safe: it is unique per account, so a repeat is refused before any funds move, and `GET /trading/orders/by-client-id/{client_order_id}` recovers the outcome. `Idempotency-Key` is not honoured for orders.
@@ -1227,6 +1473,64 @@ open_enum! {
         Paused => "paused",
         Closing => "closing",
     }
+}
+
+/// One open position.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Position {
+    /// Coin.
+    pub coin: String,
+    /// `entry_price`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry_price: Option<Amount>,
+    /// `funding_since_open`
+    pub funding_since_open: Amount,
+    /// Leverage.
+    pub leverage: i32,
+    /// `cross` or `isolated`.
+    pub leverage_type: String,
+    /// `liquidation_price`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub liquidation_price: Option<Amount>,
+    /// `margin_used`
+    pub margin_used: Amount,
+    /// `position_value`
+    pub position_value: Amount,
+    /// `return_on_equity`
+    pub return_on_equity: Amount,
+    /// `size`
+    pub size: Amount,
+    /// `unrealized_pnl`
+    pub unrealized_pnl: Amount,
+}
+
+/// A margin summary and the open positions.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Positions {
+    /// `account_value`
+    pub account_value: Amount,
+    /// `maintenance_margin`
+    pub maintenance_margin: Amount,
+    /// `margin_used`
+    pub margin_used: Amount,
+    /// The open positions.
+    #[serde(default)]
+    pub positions: Vec<Position>,
+    /// `total_notional`
+    pub total_notional: Amount,
+}
+
+/// A public trade, with nothing that identifies the parties.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FuturesPublicTrade {
+    /// `price`
+    pub price: Amount,
+    /// `buy` or `sell`: the taker's side.
+    pub side: String,
+    /// `size`
+    pub size: Amount,
+    /// When, unix milliseconds.
+    pub time: i64,
 }
 
 /// A public trade.
