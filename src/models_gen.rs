@@ -769,14 +769,7 @@ open_enum! {
         FuturesTransferRelease => "futures_transfer_release",
         FuturesCollateralSent => "futures_collateral_sent",
         FuturesCollateralReturned => "futures_collateral_returned",
-        TradeFeeRevenue => "trade_fee_revenue",
-        WithdrawalFeeRevenue => "withdrawal_fee_revenue",
         WithdrawalRefund => "withdrawal_refund",
-        WithdrawalFeeRevenueReversal => "withdrawal_fee_revenue_reversal",
-        FuturesTransferFeeRevenue => "futures_transfer_fee_revenue",
-        FuturesHyperliquidCost => "futures_hyperliquid_cost",
-        FuturesTransferDiscrepancy => "futures_transfer_discrepancy",
-        ExchangeCapital => "exchange_capital",
     }
 }
 
