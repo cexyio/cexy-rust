@@ -212,9 +212,9 @@ pub enum ResyncReason {
     SequenceGap,
     /// `balances.resync`: the server could not resume its balance change stream.
     BalancesResync,
-    /// `deposits.resync` (planned server frame): refetch the deposit list.
+    /// `deposits.resync`: refetch the deposit list.
     DepositsResync,
-    /// `withdrawals.resync` (planned server frame): refetch the withdrawal list.
+    /// `withdrawals.resync`: refetch the withdrawal list.
     WithdrawalsResync,
 }
 
@@ -1628,7 +1628,7 @@ impl Inner {
                 });
             }
             "signed_out" => {
-                // signed_out (a planned server frame): the server signed this connection out (token
+                // signed_out: the server signed this connection out (token
                 // expired, session revoked, or a future reason). Private subscriptions are gone; a
                 // fresh auth on this socket restores them.
                 let raw = frame
