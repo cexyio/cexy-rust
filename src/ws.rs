@@ -1637,7 +1637,18 @@ impl Inner {
                     .filter(|r| !r.is_empty())
                     .unwrap_or("unknown")
                     .to_string();
-                this.st.lock().unwrap().token = None;
+                {
+                    let mut s = this.st.lock().unwrap();
+                    s.token = None;
+                    if raw == "key_revoked" || raw == "key_expired" {
+                        s.key_auth = false; // the key cannot sign in again
+                    }
+                    // Already signed out: session.revoked {current: true} precedes signed_out
+                    // {reason: revoked}, and the pair is one sign-out.
+                    if s.auth_user_id.is_none() {
+                        return;
+                    }
+                }
                 match raw.as_str() {
                     "revoked" => {
                         this.signed_out(AuthChangeReason::SessionRevoked, None);
@@ -1651,7 +1662,6 @@ impl Inner {
                     }
                     "expired" => this.signed_out(AuthChangeReason::TokenExpired, None),
                     "key_revoked" | "key_expired" => {
-                        this.st.lock().unwrap().key_auth = false; // the key cannot sign in again
                         let reason = if raw == "key_revoked" {
                             AuthChangeReason::KeyRevoked
                         } else {
