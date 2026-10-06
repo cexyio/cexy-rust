@@ -1147,6 +1147,7 @@ open_enum! {
         WithdrawalCompleted => "withdrawal_completed",
         WithdrawalFailed => "withdrawal_failed",
         OrderFilled => "order_filled",
+        OrderClosed => "order_closed",
         Security => "security",
         ListingDecision => "listing_decision",
         Announcement => "announcement",
