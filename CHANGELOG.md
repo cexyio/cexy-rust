@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-dev.11] (2026-10-07)
+
 ### Added
 - Dead-man switch: `Trading::cancel_all_after(symbol, timeout)` and `cancel_all_after_markets(timeout)`
   (`POST /api/v1/trading/orders/cancel-all-after`), repeat-safe and retried like cancel-all. A zero
