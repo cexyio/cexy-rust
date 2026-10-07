@@ -6,6 +6,23 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-dev.10] (2026-10-07)
+
+### Added
+- `NotificationKind::OrderClosed` (`"order_closed"`) (cexy-api-spec `b12b03d`, order-close sync).
+
+### Changed
+- `LedgerEntryKind` drops 7 variants for kinds that ledger entries never carry: `trade_fee_revenue`,
+  `withdrawal_fee_revenue`, `withdrawal_fee_revenue_reversal`, `futures_transfer_fee_revenue`,
+  `futures_hyperliquid_cost`, `futures_transfer_discrepancy`, `exchange_capital`. Code that names one of the
+  removed variants no longer compiles.
+
+### Fixed
+- WebSocket: when the connection's own session is revoked, the server sends `session.revoked {current: true}`
+  and then `signed_out {reason: revoked}`. The client treated both as sign-outs and emitted `auth_changed`
+  and `auth_lost` twice. `signed_out` now changes nothing when the connection is already signed out, apart
+  from forgetting the token. Shared conformance case: `session_revoked_then_signed_out_once`.
+
 ## [0.1.0-dev.9] (2026-10-02)
 
 ### Added

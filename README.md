@@ -15,12 +15,12 @@ The official Rust SDK for the [CEXY.io](https://cexy.io) REST and WebSocket API.
 
 ```toml
 [dependencies]
-cexy = "=0.1.0-dev.9"
+cexy = "=0.1.0-dev.10"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
 Cargo never picks a pre-release (a version with `-dev.N`) on its own: name it explicitly. The
-exact requirement above (`=0.1.0-dev.9`) is the safest way; move it by hand for each new pre-release.
+exact requirement above (`=0.1.0-dev.10`) is the safest way; move it by hand for each new pre-release.
 
 ## Quick start: public data
 
