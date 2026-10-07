@@ -1,5 +1,7 @@
 //! The REST services: public market data, account, exports, wallet reads, trading and pools.
 
+use std::time::Duration;
+
 use crate::amount::check_amounts;
 use crate::client::Client;
 use crate::error::{Error, ErrorCategory, Result};
@@ -663,6 +665,64 @@ impl<'a> Trading<'a> {
         self.cancel_all_once(None).await
     }
 
+    /// Arms, re-arms or disarms the dead-man switch for ONE market, such as `"BTC/USDT"` (needs
+    /// the trade scope): if it is not armed again within `timeout`, the server cancels every
+    /// open order in that market. An empty or blank symbol is an error (it would mean every
+    /// market on the server); use [`Trading::cancel_all_after_markets`] for that.
+    ///
+    /// `Duration::ZERO` disarms this scope only. Any other value is sent as whole milliseconds
+    /// and the SERVER checks the range (5 s to 10 min). The SDK never rounds: a non-zero
+    /// duration below 1 ms, a duration that is not a whole number of milliseconds, or one too
+    /// large for the request is an error, so a non-zero timeout can never turn into a disarm.
+    ///
+    /// Using it:
+    /// - Arm again about every 2 s with a 10 s timeout, so a few missed calls do not fire it.
+    /// - Take your local deadline from when the call STARTED, not from when it returned, and
+    ///   never compare the local clock with the returned `deadline` (the clocks differ; use
+    ///   `server_time` only to measure the deadline against).
+    /// - A switch that has fired is cleared. To keep quoting you need a new arm first.
+    /// - The per-market switch and the all-markets switch are separate: each fires on its own,
+    ///   and `ZERO` disarms only the scope given.
+    /// - Arming is repeat-safe, so it is retried after connection errors and retryable
+    ///   responses (no Idempotency-Key is sent). An arm still in flight can land after a later
+    ///   disarm and arm it again: if the switch must be off, disarm once more after any
+    ///   retried arm.
+    /// - No endpoint reads the switch; the response to the call is all you get.
+    /// - `DEAD_MAN_NOT_ARMED` (409, not retryable) on order placement means the switch is not
+    ///   armed for that market: stop quoting and arm it. Never retry the placement.
+    pub async fn cancel_all_after(
+        &self,
+        symbol: &str,
+        timeout: Duration,
+    ) -> Result<CancelAllAfter> {
+        if symbol.trim().is_empty() {
+            return Err(Error::config(
+                "trading.cancel_all_after: symbol is required (\"BASE/QUOTE\"); use cancel_all_after_markets for every market",
+            ));
+        }
+        self.cancel_all_after_once(Some(symbol), timeout).await
+    }
+
+    /// Arms, re-arms or disarms the dead-man switch for EVERY market, with an explicit
+    /// `"symbol": null`. It is separate from the per-market switches. See
+    /// [`Trading::cancel_all_after`] for the timeout rules and how to use the switch.
+    pub async fn cancel_all_after_markets(&self, timeout: Duration) -> Result<CancelAllAfter> {
+        self.cancel_all_after_once(None, timeout).await
+    }
+
+    async fn cancel_all_after_once(
+        &self,
+        symbol: Option<&str>,
+        timeout: Duration,
+    ) -> Result<CancelAllAfter> {
+        let timeout_ms = timeout_to_ms(timeout)?;
+        // The server treats an omitted symbol as every market too, but null is explicit.
+        let body = serde_json::json!({ "timeout_ms": timeout_ms, "symbol": symbol });
+        let mut call = Call::new(OperationId::CancelAllAfter).json(&body)?;
+        call.no_idempotency_key = true;
+        self.c.get(call).await
+    }
+
     pub(crate) async fn cancel_all_once(&self, symbol: Option<&str>) -> Result<CancelAllResult> {
         self.c.get(cancel_all_call(symbol)?).await
     }
@@ -677,6 +737,20 @@ impl<'a> Trading<'a> {
         let raw = self.c.t.attempt(&cancel_all_call(symbol)?, &o).await?;
         decode_data(OperationId::CancelAll, &raw)
     }
+}
+
+/// Whole milliseconds of `d` for the dead-man switch. Zero is the only value that maps to 0.
+fn timeout_to_ms(d: Duration) -> Result<i64> {
+    if d.is_zero() {
+        return Ok(0);
+    }
+    if !d.subsec_nanos().is_multiple_of(1_000_000) {
+        return Err(Error::config(
+            "trading.cancel_all_after: timeout must be a whole number of milliseconds (at least 1 ms); use Duration::ZERO to disarm",
+        ));
+    }
+    i64::try_from(d.as_millis())
+        .map_err(|_| Error::config("trading.cancel_all_after: timeout is too large"))
 }
 
 fn cancel_all_call(symbol: Option<&str>) -> Result<Call> {

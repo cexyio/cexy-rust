@@ -25,6 +25,7 @@ async fn shared_error_cases() {
         "rate_limited",
         "idempotency_in_flight",
         "insufficient_funds",
+        "dead_man_not_armed",
         "unknown_code",
     ] {
         let Some(case) = load(&format!("errors/{name}.json")) else {

@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use serde_json::{Value, json};
 use wiremock::matchers::{method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -247,4 +249,177 @@ async fn an_undecodable_order_response_carries_the_client_order_id() {
         }
         other => panic!("{other:?}"),
     }
+}
+
+fn armed(symbol: Value, timeout_ms: i64) -> ResponseTemplate {
+    data(json!({
+        "armed": timeout_ms != 0,
+        "deadline": if timeout_ms != 0 { json!("2026-10-07T12:00:10Z") } else { Value::Null },
+        "server_time": "2026-10-07T12:00:00Z",
+        "symbol": symbol,
+        "timeout_ms": timeout_ms,
+    }))
+}
+
+const AFTER_PATH: &str = "/api/v1/trading/orders/cancel-all-after";
+
+#[tokio::test]
+async fn cancel_all_after_bodies_and_response() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(AFTER_PATH))
+        .respond_with(armed(json!("BTC/USDT"), 10_000))
+        .mount(&server)
+        .await;
+    let (c, _) = client(&server);
+    let r = c
+        .trading()
+        .cancel_all_after("BTC/USDT", Duration::from_secs(10))
+        .await
+        .unwrap();
+    assert!(r.armed);
+    assert_eq!(r.timeout_ms, 10_000);
+    assert_eq!(r.symbol.as_deref(), Some("BTC/USDT"));
+    assert!(r.deadline.is_some());
+    c.trading()
+        .cancel_all_after_markets(Duration::from_secs(10))
+        .await
+        .unwrap();
+    c.trading()
+        .cancel_all_after("BTC/USDT", Duration::ZERO)
+        .await
+        .unwrap();
+    let reqs = server.received_requests().await.unwrap();
+    assert_eq!(reqs.len(), 3);
+    assert_eq!(
+        body(&reqs[0]),
+        json!({"symbol": "BTC/USDT", "timeout_ms": 10000})
+    );
+    // Every market is an explicit null, not an omitted field.
+    assert_eq!(body(&reqs[1]), json!({"symbol": null, "timeout_ms": 10000}));
+    assert_eq!(
+        body(&reqs[2]),
+        json!({"symbol": "BTC/USDT", "timeout_ms": 0})
+    );
+    assert!(
+        reqs.iter()
+            .all(|r| !r.headers.contains_key("idempotency-key"))
+    );
+}
+
+#[tokio::test]
+async fn cancel_all_after_disarm_decodes_null_deadline() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(AFTER_PATH))
+        .respond_with(armed(Value::Null, 0))
+        .mount(&server)
+        .await;
+    let (c, _) = client(&server);
+    let r = c
+        .trading()
+        .cancel_all_after_markets(Duration::ZERO)
+        .await
+        .unwrap();
+    assert!(!r.armed);
+    assert!(r.deadline.is_none());
+    assert!(r.symbol.is_none());
+    let reqs = server.received_requests().await.unwrap();
+    assert_eq!(body(&reqs[0]), json!({"symbol": null, "timeout_ms": 0}));
+}
+
+#[tokio::test]
+async fn cancel_all_after_rejects_bad_input_without_a_request() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(armed(Value::Null, 0))
+        .mount(&server)
+        .await;
+    let (c, _) = client(&server);
+    let t = c.trading();
+    let ten = Duration::from_secs(10);
+    for sym in ["", " ", "\t\n"] {
+        assert!(matches!(
+            t.cancel_all_after(sym, ten).await,
+            Err(Error::Config(_))
+        ));
+    }
+    for d in [
+        Duration::from_micros(999),
+        Duration::from_micros(1500),
+        Duration::from_nanos(1),
+        Duration::new(10, 1),
+        Duration::MAX,
+        Duration::from_millis(u64::MAX),
+    ] {
+        assert!(
+            matches!(
+                t.cancel_all_after("BTC/USDT", d).await,
+                Err(Error::Config(_))
+            ),
+            "{d:?}"
+        );
+        assert!(
+            matches!(t.cancel_all_after_markets(d).await, Err(Error::Config(_))),
+            "{d:?}"
+        );
+    }
+    assert!(server.received_requests().await.unwrap().is_empty());
+    // The server owns the range check: 1 ms is sent as is.
+    t.cancel_all_after("BTC/USDT", Duration::from_millis(1))
+        .await
+        .unwrap();
+    let reqs = server.received_requests().await.unwrap();
+    assert_eq!(body(&reqs[0])["timeout_ms"], json!(1));
+}
+
+#[tokio::test]
+async fn cancel_all_after_is_retried_after_a_connection_error() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(AFTER_PATH))
+        .respond_with(Sequence::new(vec![
+            api_error(503, "SERVICE_UNAVAILABLE", true),
+            armed(json!("BTC/USDT"), 10_000),
+        ]))
+        .mount(&server)
+        .await;
+    let (c, _) = client(&server);
+    let r = c
+        .trading()
+        .cancel_all_after("BTC/USDT", Duration::from_secs(10))
+        .await
+        .unwrap();
+    assert!(r.armed);
+    assert_eq!(server.received_requests().await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn dead_man_not_armed_on_place_order_is_not_retried_or_recovered() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/trading/orders"))
+        .respond_with(ResponseTemplate::new(409).set_body_json(json!({"error": {
+            "code": "DEAD_MAN_NOT_ARMED",
+            "message": "arm cancel-all-after first",
+            "details": {"market": "BTC/USDT"},
+            "retryable": false,
+        }})))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path_regex("^/api/v1/trading/orders/by-client-id/"))
+        .respond_with(data(order("ord_9", "open")))
+        .mount(&server)
+        .await;
+    let (c, _) = client(&server);
+    let e = c.trading().place_order(&limit_order()).await.unwrap_err();
+    let api = e.api().unwrap();
+    assert_eq!(api.code, crate::ErrorCode::DeadManNotArmed);
+    assert_eq!(api.details.get("market"), Some(&json!("BTC/USDT")));
+    assert!(e.is(ErrorCategory::Conflict));
+    assert!(!e.is_retryable());
+    assert!(!e.is_ambiguous());
+    // One POST, and no by-client-id lookup.
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
 }

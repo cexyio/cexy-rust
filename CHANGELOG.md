@@ -6,6 +6,12 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- Dead-man switch: `Trading::cancel_all_after(symbol, timeout)` and `cancel_all_after_markets(timeout)`
+  (`POST /api/v1/trading/orders/cancel-all-after`), repeat-safe and retried like cancel-all. A zero
+  `Duration` disarms; a non-zero timeout that is under 1 ms, not whole milliseconds or too large is an
+  error. New `ErrorCode::DeadManNotArmed` (409, not retried, `details.market`).
+
 ## [0.1.0-dev.10] (2026-10-07)
 
 ### Added

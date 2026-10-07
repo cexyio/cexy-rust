@@ -9,8 +9,8 @@ use super::helpers::*;
 use crate::{CallOptions, Client, ClientOptions, Error, ErrorCategory, OperationId};
 
 #[test]
-fn surface_has_51_operations() {
-    assert_eq!(OperationId::ALL.len(), 51);
+fn surface_has_52_operations() {
+    assert_eq!(OperationId::ALL.len(), 52);
     let place = OperationId::PlaceOrder.info();
     assert_eq!(
         (place.method, place.path, place.auth, place.scope),
