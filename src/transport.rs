@@ -409,11 +409,12 @@ impl Transport {
 }
 
 /// Whether `request` may retry `c`: reads, and the mutations that are safe to repeat: pool join
-/// and exit with their Idempotency-Key (the server honours it there), and cancel-all (naturally
+/// and exit with their Idempotency-Key (the server honours it there), and cancel-all and cancel-all-after (naturally
 /// repeatable). The server ignores Idempotency-Key elsewhere, so no other mutation is retried.
 fn repeat_safe(c: &Call) -> bool {
     c.op.info().method == "GET"
         || c.op == OperationId::CancelAll
+        || c.op == OperationId::CancelAllAfter
         || (matches!(c.op, OperationId::JoinPool | OperationId::ExitPool)
             && c.idempotency_key.is_some())
 }

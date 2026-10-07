@@ -18,6 +18,8 @@ pub const SPEC_VERSION: &str = "1.0.0";
 pub enum OperationId {
     /// `cancel_all`
     CancelAll,
+    /// `cancel_all_after`
+    CancelAllAfter,
     /// `cancel_order`
     CancelOrder,
     /// `candles`
@@ -134,9 +136,10 @@ pub struct OperationInfo {
 }
 
 impl OperationId {
-    /// Every operation of the SDK surface (51).
-    pub const ALL: [OperationId; 51] = [
+    /// Every operation of the SDK surface (52).
+    pub const ALL: [OperationId; 52] = [
         OperationId::CancelAll,
+        OperationId::CancelAllAfter,
         OperationId::CancelOrder,
         OperationId::Candles,
         OperationId::DepositAddress,
@@ -193,6 +196,7 @@ impl OperationId {
     pub fn as_str(self) -> &'static str {
         match self {
             OperationId::CancelAll => "cancel_all",
+            OperationId::CancelAllAfter => "cancel_all_after",
             OperationId::CancelOrder => "cancel_order",
             OperationId::Candles => "candles",
             OperationId::DepositAddress => "deposit_address",
@@ -252,6 +256,12 @@ impl OperationId {
             OperationId::CancelAll => OperationInfo {
                 method: "POST",
                 path: "/api/v1/trading/orders/cancel-all",
+                auth: "api_key",
+                scope: "trade",
+            },
+            OperationId::CancelAllAfter => OperationInfo {
+                method: "POST",
+                path: "/api/v1/trading/orders/cancel-all-after",
                 auth: "api_key",
                 scope: "trade",
             },

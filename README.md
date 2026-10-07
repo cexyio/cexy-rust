@@ -354,6 +354,28 @@ skipped (after a short reorder window, `WsOptions::reorder_window`, default 250 
 state over REST. `balances.resync`, `deposits.resync` and `withdrawals.resync` (the last two
 planned) emit `Resync` with `BalancesResync`, `DepositsResync` or `WithdrawalsResync`.
 
+### Dead-man switch
+
+`cancel_all_after(symbol, timeout)` and `cancel_all_after_markets(timeout)` arm a server-side timer: if you do
+not arm again in time, the exchange cancels every open order in that scope. `Duration::ZERO` disarms that
+scope only. The server checks the range (5 s to 10 min); the SDK refuses a non-zero timeout that is not a whole
+number of milliseconds, so it can never turn into a disarm.
+
+```rust
+# async fn run(c: cexy::Client) -> cexy::Result<()> {
+use std::time::Duration;
+// Arm about every 2 s with a 10 s timeout. Time the local deadline from when the call started.
+let armed = c.trading().cancel_all_after("BTC/USDT", Duration::from_secs(10)).await?;
+println!("armed: {}", armed.armed);
+// every market: c.trading().cancel_all_after_markets(Duration::from_secs(10))
+# Ok(()) }
+```
+
+A fired switch is cleared: arm again before quoting. The per-market and all-markets switches are separate.
+Arming is retried after connection errors; if the switch must be off after a retried arm, disarm once more.
+Nothing reads the switch, and the returned `deadline` is on the server's clock (do not compare it with yours).
+`DEAD_MAN_NOT_ARMED` on `place_order` (409, not retried) means stop quoting.
+
 ### Futures channels
 
 Public: `futures.mids`, `futures.orderbook:{coin}`, `futures.trades:{coin}`,
@@ -506,7 +528,7 @@ Report vulnerabilities as described in [SECURITY.md](SECURITY.md).
 
 ## For tool builders
 
-`OperationId::ALL` and `OperationId::info()` describe the 40 operations (method, path, auth and scope).
+`OperationId::ALL` and `OperationId::info()` describe the 52 operations (method, path, auth and scope).
 The crate also exports every model type, the error types, the `Authenticator` trait (HMAC signing will
 plug in here) and `ClientOptions::user_agent_suffix` to identify your tool.
 

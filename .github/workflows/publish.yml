@@ -15,7 +15,7 @@ permissions:
 # The cexy-api-spec commit the spec and conformance tests run against. Pinned so that a spec
 # change cannot silently change what CI tests; bump it in a reviewed PR.
 env:
-  SPEC_COMMIT: dd57dccc09be628282b116f572017822b0a50005
+  SPEC_COMMIT: e9272a0ffa2a313e45114a278fb667ff2be8ce19
 
 jobs:
   build:

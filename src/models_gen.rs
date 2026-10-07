@@ -172,6 +172,43 @@ pub struct Balance {
     pub total: Amount,
 }
 
+/// Arms, re-arms or disarms the dead-man switch.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CancelAllAfterRequest {
+    /// One market's orders only. Omitted or `null`, the switch covers every market. A per-market switch and the all-markets switch are separate: each fires on its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub symbol: Option<String>,
+    /// Milliseconds from now after which the open orders in scope are cancelled, unless the switch is armed again first: from 5000 to 600000. `0` disarms.
+    pub timeout_ms: i64,
+}
+
+impl CancelAllAfterRequest {
+    /// A request with the required fields (timeout_ms); the optional ones are unset.
+    pub fn new(timeout_ms: i64) -> Self {
+        Self {
+            timeout_ms,
+            symbol: None,
+        }
+    }
+}
+
+/// The dead-man switch, as just set.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CancelAllAfter {
+    /// Whether a deadline is now armed for this scope. `false` after a disarm.
+    pub armed: bool,
+    /// When the orders are cancelled unless armed again. `null` when disarmed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deadline: Option<DateTime<Utc>>,
+    /// The server's clock when the switch was set, to measure the deadline against.
+    pub server_time: DateTime<Utc>,
+    /// The market it covers, or `null` for every market.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub symbol: Option<String>,
+    /// The timeout asked for, in milliseconds.
+    pub timeout_ms: i64,
+}
+
 /// Cancels every open order, optionally within one market.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct CancelAllRequest {
@@ -393,6 +430,7 @@ open_enum! {
         EvidenceContradicts => "EVIDENCE_CONTRADICTS",
         AmountMismatch => "AMOUNT_MISMATCH",
         ConcurrentModification => "CONCURRENT_MODIFICATION",
+        DeadManNotArmed => "DEAD_MAN_NOT_ARMED",
         InsufficientFunds => "INSUFFICIENT_FUNDS",
         InsufficientFeeFunds => "INSUFFICIENT_FEE_FUNDS",
         MarketUnavailable => "MARKET_UNAVAILABLE",
