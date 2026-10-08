@@ -166,6 +166,10 @@ match c.trading().place_order(&order).await {
 - Retried: connection errors, timeouts and responses with `retryable: true` (and 409
   `CONCURRENT_MODIFICATION`). A 4xx is never retried except 429 and 409 `CONCURRENT_MODIFICATION`,
   whatever its body says.
+- After a 429 with a wait hint, the client-side rate limiter holds every other request of the client for
+  that wait (at most 120 s), not only the retried one. A key that keeps sending through its own limit counts
+  against its IP's failed-key limit (120 a minute) and can lock out every other key on that IP. Market makers:
+  run the cancel/risk key from its own egress IP; a separate key on the same IP is not isolated.
 - A 429 waits at least `Retry-After` / `details.retry_after_seconds`.
 - GETs retry freely.
 - **Orders:** safety rests on `client_order_id`, not on `Idempotency-Key` (the server does not honour
