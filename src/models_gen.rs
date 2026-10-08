@@ -175,7 +175,7 @@ pub struct Balance {
 /// Arms, re-arms or disarms the dead-man switch.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CancelAllAfterRequest {
-    /// One market's orders only. Omitted or `null`, the switch covers every market. A per-market switch and the all-markets switch are separate: each fires on its own.
+    /// One market's orders only. Omitted or `null`, the switch covers every market; an empty string is refused (400). A per-market switch and the all-markets switch are separate: each fires on its own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub symbol: Option<String>,
     /// Milliseconds from now after which the open orders in scope are cancelled, unless the switch is armed again first: from 5000 to 600000. `0` disarms.
@@ -200,7 +200,7 @@ pub struct CancelAllAfter {
     /// When the orders are cancelled unless armed again. `null` when disarmed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deadline: Option<DateTime<Utc>>,
-    /// The server's clock when the switch was set, to measure the deadline against.
+    /// The server's time after the deadline was stored, to measure the deadline against.
     pub server_time: DateTime<Utc>,
     /// The market it covers, or `null` for every market.
     #[serde(default, skip_serializing_if = "Option::is_none")]
