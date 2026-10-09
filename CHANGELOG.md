@@ -6,6 +6,17 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-dev.12] (2026-10-09)
+
+### Changed
+- README, rate limits: after a 429 with a wait hint the client holds every request, not only the
+  retried one. A key that keeps sending through its own limit counts against its IP's failed-key limit
+  (120 a minute); market makers should send their cancel/risk key from its own egress IP.
+- README, "Market buys by total": a market buy by `quote_quantity` spends at most the budget, taker fee
+  included (`filled_quote_quantity + fee_paid <= quote_quantity`); the precision rule
+  (`PRECISION_EXCEEDED`), how a budget order ends and how to read its progress.
+- Built against cexy-api-spec `b0451a0` (`place_order` description text only; no model change).
+
 ## [0.1.0-dev.11] (2026-10-07)
 
 ### Added
