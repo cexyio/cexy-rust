@@ -113,9 +113,12 @@ A market buy can name a budget, `quote_quantity`, instead of a `quantity`: "spen
 much of the quote asset".
 
 ```rust
+# async fn run(c: cexy::Client) -> cexy::Result<()> {
+use cexy::{Amount, OrderSide, OrderType, PlaceOrderRequest};
 let mut order = PlaceOrderRequest::new("BTC/USDT", OrderSide::Buy, OrderType::Market);
 order.quote_quantity = Some(Amount::new("50.00")?);
 let placed = c.trading().place_order(&order).await?;
+# Ok(()) }
 ```
 
 - **The taker fee is inside the budget:** `filled_quote_quantity + fee_paid <= quote_quantity`,
