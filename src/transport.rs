@@ -13,13 +13,16 @@ use crate::error::{
     ConnectionError, Error, ErrorCategory, MAX_SERVER_WAIT, Result, error_from_response,
     redirect_error,
 };
-use crate::limiter::RateLimiter;
+use crate::limiter::{PlacementHold, RateLimiter};
 use crate::operations_gen::OperationId;
 use crate::signing::{encode_bytes, encode_query};
 
 const BACKOFF_BASE: Duration = Duration::from_millis(500);
 const BACKOFF_MAX: Duration = Duration::from_secs(10);
 const MAX_RESPONSE_BODY: usize = 64 << 20;
+/// `details.limit` on a 429 that refused order actions (a market maker's per-second budget). It
+/// holds only placements, never reads or cancels.
+pub(crate) const ORDER_ACTIONS_LIMIT: &str = "order_actions";
 
 /// Passed to `ClientOptions::on_retry` before the SDK waits and retries. It never holds
 /// credentials.
@@ -53,6 +56,34 @@ pub(crate) struct Call {
     pub(crate) idempotency_key: Option<String>,
     /// The endpoint does not honour Idempotency-Key, so none is sent.
     pub(crate) no_idempotency_key: bool,
+    /// Request tokens this call takes from the client limiter on each attempt (a batch of N
+    /// takes N).
+    pub(crate) cost: u32,
+    /// Placements in this call (0 for anything else): they wait out an `order_actions` hold and
+    /// the optional order-actions budget.
+    pub(crate) order_actions: u32,
+}
+
+/// How a failed attempt ended, as the batch calls need to know it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Attempt {
+    /// The server may have acted: a connection error or timeout, any HTTP 5xx except 501 and
+    /// 503 (Cloudflare's 520 and 524 included), or a 2xx that is not JSON.
+    Ambiguous,
+    /// It did not: a 429, a 501, a 503 or any other 4xx.
+    Refused,
+}
+
+impl Attempt {
+    pub(crate) fn of(e: &Error) -> Attempt {
+        match e {
+            Error::Connection(_) | Error::Decode(_) => Attempt::Ambiguous,
+            Error::Api(a) if a.status >= 500 && !matches!(a.status, 501 | 503) => {
+                Attempt::Ambiguous
+            }
+            _ => Attempt::Refused,
+        }
+    }
 }
 
 impl Call {
@@ -65,7 +96,17 @@ impl Call {
             text: false,
             idempotency_key: None,
             no_idempotency_key: false,
+            cost: 1,
+            order_actions: 0,
         }
+    }
+    pub(crate) fn cost(mut self, tokens: u32) -> Call {
+        self.cost = tokens;
+        self
+    }
+    pub(crate) fn order_actions(mut self, n: u32) -> Call {
+        self.order_actions = n;
+        self
     }
     pub(crate) fn path(mut self, name: &'static str, value: &str) -> Call {
         self.path.push((name, value.to_string()));
@@ -105,6 +146,10 @@ pub(crate) struct Transport {
     pub(crate) http: reqwest::Client,
     pub(crate) auth: Option<Arc<dyn Authenticator>>,
     pub(crate) limiter: Option<RateLimiter>,
+    /// Set with the limiter: an `order_actions` 429 holds placements here instead.
+    pub(crate) placement_hold: Option<PlacementHold>,
+    /// The optional order-actions budget (`ClientOptions::order_actions_per_second`).
+    pub(crate) order_limiter: Option<RateLimiter>,
     pub(crate) user_agent: String,
     pub(crate) timeout: Duration,
     pub(crate) max_retries: u32,
@@ -120,7 +165,18 @@ impl Transport {
     /// it on pool join and exit. A mutation is retried only when it is repeat-safe (see
     /// [`repeat_safe`]); any other is sent once. `place_order` and `cancel_order` use `attempt`
     /// with their own policies.
-    pub(crate) async fn request(&self, mut c: Call, o: &Resolved) -> Result<Raw> {
+    pub(crate) async fn request(&self, c: Call, o: &Resolved) -> Result<Raw> {
+        self.request_noting(c, o, &mut Vec::new()).await
+    }
+
+    /// [`Transport::request`], appending to `attempts` how each failed attempt ended. The batch
+    /// calls read it to tell a lost answer from a definite refusal.
+    pub(crate) async fn request_noting(
+        &self,
+        mut c: Call,
+        o: &Resolved,
+        attempts: &mut Vec<Attempt>,
+    ) -> Result<Raw> {
         let info = c.op.info();
         if info.method != "GET" && c.idempotency_key.is_none() && !c.no_idempotency_key {
             c.idempotency_key = Some(o.idempotency_key.clone().unwrap_or_else(new_id));
@@ -131,6 +187,7 @@ impl Transport {
             match self.attempt(&c, o).await {
                 Ok(raw) => return Ok(raw),
                 Err(e) => {
+                    attempts.push(Attempt::of(&e));
                     if attempt >= max_retries || !e.is_retryable() {
                         return Err(e);
                     }
@@ -235,7 +292,15 @@ impl Transport {
             )));
         }
         if let Some(l) = &self.limiter {
-            l.acquire().await;
+            l.acquire(c.cost).await;
+        }
+        if c.order_actions > 0 {
+            if let Some(h) = &self.placement_hold {
+                h.wait().await;
+            }
+            if let Some(l) = &self.order_limiter {
+                l.acquire(c.order_actions).await;
+            }
         }
 
         let mut headers = HeaderMap::new();
@@ -334,7 +399,12 @@ impl Transport {
             if e.is(ErrorCategory::RateLimited)
                 && let (Some(ra), Some(l)) = (e.retry_after, &self.limiter)
             {
-                l.block_for(ra);
+                let order_actions = e.details.get("limit").and_then(serde_json::Value::as_str)
+                    == Some(ORDER_ACTIONS_LIMIT);
+                match &self.placement_hold {
+                    Some(h) if order_actions => h.hold_for(ra),
+                    _ => l.block_for(ra),
+                }
             }
             return Err(e.into());
         }
@@ -409,12 +479,20 @@ impl Transport {
 }
 
 /// Whether `request` may retry `c`: reads, and the mutations that are safe to repeat: pool join
-/// and exit with their Idempotency-Key (the server honours it there), and cancel-all and cancel-all-after (naturally
-/// repeatable). The server ignores Idempotency-Key elsewhere, so no other mutation is retried.
+/// and exit with their Idempotency-Key (the server honours it there), cancel-all, cancel-all-after,
+/// cancel by client order id and cancel-batch (naturally repeatable), and place-batch (every
+/// order carries a `client_order_id`, so the server refuses a repeat as `ALREADY_EXISTS`). The
+/// server ignores Idempotency-Key elsewhere, so no other mutation is retried.
 fn repeat_safe(c: &Call) -> bool {
     c.op.info().method == "GET"
-        || c.op == OperationId::CancelAll
-        || c.op == OperationId::CancelAllAfter
+        || matches!(
+            c.op,
+            OperationId::CancelAll
+                | OperationId::CancelAllAfter
+                | OperationId::PlaceBatch
+                | OperationId::CancelBatch
+                | OperationId::CancelOrderByClientId
+        )
         || (matches!(c.op, OperationId::JoinPool | OperationId::ExitPool)
             && c.idempotency_key.is_some())
 }

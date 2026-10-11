@@ -22,6 +22,7 @@ mod macros;
 
 mod amount;
 mod auth;
+mod batch;
 mod cancel_all;
 mod client;
 mod clock;
@@ -41,14 +42,18 @@ mod ws_futures;
 
 pub use amount::{Amount, BookLevel, levels};
 pub use auth::{ApiKeyAuthenticator, AuthRequest, Authenticator};
+pub use batch::{
+    BatchCancelResult, BatchOrderInput, BatchOrderOutcome, BatchPlaceResult, CancelEntryOutcome,
+    CancelOutcome, MAX_BATCH_ORDERS, MAX_CANCEL_ENTRIES, PlaceOutcome, new_client_order_id,
+};
 pub use cancel_all::{CancelAllOptions, CancelAllStop, CancelAllSummary, CancelAllTarget};
 pub use client::{
     AuthScheme, CallOptions, Client, ClientOptions, DEFAULT_BASE_URL, DEFAULT_RPM_ANONYMOUS,
     DEFAULT_RPM_WITH_KEY, OnRetry, is_local_host,
 };
 pub use error::{
-    ApiError, ConnectionError, Error, ErrorCategory, MAX_SERVER_WAIT, PAGING_CURSOR_REPEATED,
-    PAGING_STALLED, Result, WsError,
+    ApiError, ConnectionError, Error, ErrorBody, ErrorCategory, MAX_SERVER_WAIT,
+    PAGING_CURSOR_REPEATED, PAGING_STALLED, Result, WsError,
 };
 pub use limiter::RateLimitState;
 pub use live_balances::{

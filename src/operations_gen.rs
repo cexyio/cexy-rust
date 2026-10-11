@@ -20,8 +20,12 @@ pub enum OperationId {
     CancelAll,
     /// `cancel_all_after`
     CancelAllAfter,
+    /// `cancel_batch`
+    CancelBatch,
     /// `cancel_order`
     CancelOrder,
+    /// `cancel_order_by_client_id`
+    CancelOrderByClientId,
     /// `candles`
     Candles,
     /// `deposit_address`
@@ -108,6 +112,8 @@ pub enum OperationId {
     OrderHistory,
     /// `orderbook`
     Orderbook,
+    /// `place_batch`
+    PlaceBatch,
     /// `place_order`
     PlaceOrder,
     /// `positions`
@@ -136,11 +142,13 @@ pub struct OperationInfo {
 }
 
 impl OperationId {
-    /// Every operation of the SDK surface (52).
-    pub const ALL: [OperationId; 52] = [
+    /// Every operation of the SDK surface (55).
+    pub const ALL: [OperationId; 55] = [
         OperationId::CancelAll,
         OperationId::CancelAllAfter,
+        OperationId::CancelBatch,
         OperationId::CancelOrder,
+        OperationId::CancelOrderByClientId,
         OperationId::Candles,
         OperationId::DepositAddress,
         OperationId::ExchangeConfig,
@@ -184,6 +192,7 @@ impl OperationId {
         OperationId::OpenOrders,
         OperationId::OrderHistory,
         OperationId::Orderbook,
+        OperationId::PlaceBatch,
         OperationId::PlaceOrder,
         OperationId::Positions,
         OperationId::ServerTime,
@@ -197,7 +206,9 @@ impl OperationId {
         match self {
             OperationId::CancelAll => "cancel_all",
             OperationId::CancelAllAfter => "cancel_all_after",
+            OperationId::CancelBatch => "cancel_batch",
             OperationId::CancelOrder => "cancel_order",
+            OperationId::CancelOrderByClientId => "cancel_order_by_client_id",
             OperationId::Candles => "candles",
             OperationId::DepositAddress => "deposit_address",
             OperationId::ExchangeConfig => "exchange_config",
@@ -241,6 +252,7 @@ impl OperationId {
             OperationId::OpenOrders => "open_orders",
             OperationId::OrderHistory => "order_history",
             OperationId::Orderbook => "orderbook",
+            OperationId::PlaceBatch => "place_batch",
             OperationId::PlaceOrder => "place_order",
             OperationId::Positions => "positions",
             OperationId::ServerTime => "server_time",
@@ -265,9 +277,21 @@ impl OperationId {
                 auth: "api_key",
                 scope: "trade",
             },
+            OperationId::CancelBatch => OperationInfo {
+                method: "POST",
+                path: "/api/v1/trading/orders/cancel-batch",
+                auth: "api_key",
+                scope: "trade",
+            },
             OperationId::CancelOrder => OperationInfo {
                 method: "DELETE",
                 path: "/api/v1/trading/orders/{order_id}",
+                auth: "api_key",
+                scope: "trade",
+            },
+            OperationId::CancelOrderByClientId => OperationInfo {
+                method: "DELETE",
+                path: "/api/v1/trading/orders/by-client-id/{client_order_id}",
                 auth: "api_key",
                 scope: "trade",
             },
@@ -528,6 +552,12 @@ impl OperationId {
                 path: "/api/v1/futures/markets/{coin}/orderbook",
                 auth: "none",
                 scope: "",
+            },
+            OperationId::PlaceBatch => OperationInfo {
+                method: "POST",
+                path: "/api/v1/trading/orders/batch",
+                auth: "api_key",
+                scope: "trade",
             },
             OperationId::PlaceOrder => OperationInfo {
                 method: "POST",

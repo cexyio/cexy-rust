@@ -1,6 +1,7 @@
 //! Offline tests: mocked HTTP (wiremock), a local WebSocket server, and the shared conformance
 //! cases from cexy-api-spec.
 
+mod batch;
 mod cancel_all;
 mod client;
 mod conformance;

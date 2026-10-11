@@ -10,6 +10,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::amount::Amount;
+use crate::error::ErrorBody;
 
 /// The id of the account a credential belongs to, and nothing else.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -38,6 +39,8 @@ pub struct ApiKey {
     /// When it was last used, if ever.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_used_at: Option<DateTime<Utc>>,
+    /// Its rate-limit tier: `default`, or `mm` for a market maker's key, which only the exchange sets.
+    pub rate_tier: String,
     /// Whether it has been revoked.
     pub revoked: bool,
     /// Granted scopes.
@@ -172,6 +175,85 @@ pub struct Balance {
     pub total: Amount,
 }
 
+/// One order of a batch: an order as for `POST /trading/orders`, without the symbol, and with `client_order_id` required.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BatchOrderItem {
+    /// Your own identifier, unique per account. Required: a retry of the batch is answered `ALREADY_EXISTS` for every order it already placed, so nothing is placed twice.
+    pub client_order_id: String,
+    /// `price`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub price: Option<Amount>,
+    /// `quantity`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quantity: Option<Amount>,
+    /// `quote_quantity`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quote_quantity: Option<Amount>,
+    /// `side`
+    pub side: OrderSide,
+    /// `stop_price`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_price: Option<Amount>,
+    /// `time_in_force`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_in_force: Option<TimeInForce>,
+    /// `trigger_direction`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger_direction: Option<TriggerDirection>,
+    /// `type`
+    pub r#type: OrderType,
+}
+
+/// Places up to 20 orders in one market (Phase 0 B2).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BatchOrderRequest {
+    /// The orders, 1 to 20, placed one after another in this order.
+    #[serde(default)]
+    pub orders: Vec<BatchOrderItem>,
+    /// The market every order is placed in.
+    pub symbol: String,
+}
+
+impl BatchOrderRequest {
+    /// A request with the required fields (symbol); the optional ones are unset.
+    pub fn new(symbol: impl Into<String>) -> Self {
+        Self {
+            symbol: symbol.into(),
+            orders: Default::default(),
+        }
+    }
+}
+
+/// What a batch did: one result per order, in the order sent.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BatchOrder {
+    /// How many were refused.
+    pub failed: i64,
+    /// How many were accepted.
+    pub placed: i64,
+    /// One per order sent, in the same order.
+    #[serde(default)]
+    pub results: Vec<BatchOrderResult>,
+}
+
+/// One order's outcome in a batch: exactly one of `order` and `error` is set.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BatchOrderResult {
+    /// Its `client_order_id`, as sent.
+    pub client_order_id: String,
+    /// `error`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<ErrorBody>,
+    /// Fills produced on entry, oldest first; empty when refused.
+    #[serde(default)]
+    pub fills: Vec<Fill>,
+    /// Its position in the request, from 0.
+    pub index: i64,
+    /// `order`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub order: Option<Order>,
+}
+
 /// Arms, re-arms or disarms the dead-man switch.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CancelAllAfterRequest {
@@ -236,6 +318,56 @@ pub struct CancelAllResult {
     pub failures: Vec<CancelFailure>,
     /// More open orders exist than one call handles (500). Call again.
     pub has_more: bool,
+}
+
+/// One order to cancel: exactly one of `order_id` and `client_order_id`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CancelBatchItem {
+    /// Your identifier for it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_order_id: Option<String>,
+    /// The order's id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub order_id: Option<String>,
+}
+
+/// Cancels up to 50 orders, each named by its id or by your own (Phase 0 B2).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CancelBatchRequest {
+    /// The orders, 1 to 50, cancelled one after another in this order.
+    #[serde(default)]
+    pub orders: Vec<CancelBatchItem>,
+}
+
+/// What a batch cancel did: one result per entry, in the order sent.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CancelBatch {
+    /// How many were cancelled.
+    pub cancelled: i64,
+    /// How many were not.
+    pub failed: i64,
+    /// One per entry sent, in the same order.
+    #[serde(default)]
+    pub results: Vec<CancelBatchResult>,
+}
+
+/// One entry's outcome in a batch cancel: exactly one of `order` and `error` is set.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CancelBatchResult {
+    /// The client order id, as sent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_order_id: Option<String>,
+    /// `error`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<ErrorBody>,
+    /// Its position in the request, from 0.
+    pub index: i64,
+    /// `order`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub order: Option<Order>,
+    /// The order id, as sent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub order_id: Option<String>,
 }
 
 /// Why one order could not be cancelled.

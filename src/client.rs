@@ -9,7 +9,7 @@ use url::Url;
 use crate::auth::{ApiKeyAuthenticator, Authenticator, REDACTED};
 use crate::clock::{self, Clock};
 use crate::error::{Error, Result};
-use crate::limiter::{RateLimitState, RateLimiter};
+use crate::limiter::{PlacementHold, RateLimitState, RateLimiter};
 use crate::models_gen::{ExchangeConfig, ServerTime};
 use crate::operations_gen::OperationId;
 use crate::services::{
@@ -71,8 +71,13 @@ pub struct ClientOptions {
     /// credentials and [`DEFAULT_RPM_WITH_KEY`] with them. It adapts downwards to the server's
     /// `X-RateLimit-*` headers.
     pub requests_per_minute: Option<u32>,
-    /// Disables the client-side rate limiter.
+    /// Disables the client-side rate limiter (and the placement hold that follows a 429 for
+    /// order actions).
     pub disable_rate_limit: bool,
+    /// A client-side budget for placements, in order actions a second (a batch of N counts N),
+    /// off by default. A market maker's key has 50 a second on the server: set `Some(50.0)` to
+    /// wait locally instead of being refused. Cancels never count against it.
+    pub order_actions_per_second: Option<f64>,
     /// Appended to the User-Agent: `"my-bot/1.2"` gives `"cexy-rust/<VERSION> my-bot/1.2"`.
     pub user_agent_suffix: Option<String>,
     /// Called before each retry (for logging or metrics). Never receives credentials.
@@ -200,6 +205,16 @@ impl Client {
             }
             Some(RateLimiter::new(rpm, clock.clone()))
         };
+        let order_limiter = match o.order_actions_per_second {
+            None => None,
+            Some(n) if n.is_finite() && n > 0.0 => Some(RateLimiter::per_second(n, clock.clone())),
+            Some(_) => {
+                return Err(Error::config(
+                    "order_actions_per_second must be a positive number",
+                ));
+            }
+        };
+        let placement_hold = limiter.as_ref().map(|_| PlacementHold::new(clock.clone()));
         let mut user_agent = crate::USER_AGENT.to_string();
         if let Some(s) = o
             .user_agent_suffix
@@ -223,6 +238,8 @@ impl Client {
             http,
             auth,
             limiter,
+            placement_hold,
+            order_limiter,
             user_agent,
             timeout,
             max_retries: o.max_retries.unwrap_or(3),
