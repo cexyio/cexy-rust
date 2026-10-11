@@ -3,12 +3,17 @@
 use std::time::Duration;
 
 use crate::amount::check_amounts;
+use crate::batch::{
+    BatchCancelResult, BatchOrderInput, BatchOrderOutcome, BatchPlaceResult, CancelEntryOutcome,
+    CancelOutcome, PlaceOutcome, cancel_from_result, cancel_result, check_cancel, check_place,
+    needs_lookup, place_from_result, place_result,
+};
 use crate::client::Client;
 use crate::error::{Error, ErrorCategory, Result};
 use crate::models_gen::*;
 use crate::operations_gen::*;
 use crate::pagination::{HistoryPage, ItemStream, Page, paginate, paginate_history};
-use crate::transport::{Call, decode, decode_data, new_id};
+use crate::transport::{Attempt, Call, decode, decode_data, new_id};
 
 fn q<P>(
     params: Option<&P>,
@@ -528,7 +533,9 @@ impl<'a> Trading<'a> {
         order.client_order_id = Some(client_order_id.clone());
         let o = self.c.resolved();
         // No Idempotency-Key: the server does not honour one on orders (client_order_id does the job).
-        let call = Call::new(OperationId::PlaceOrder).json(&order)?;
+        let call = Call::new(OperationId::PlaceOrder)
+            .order_actions(1)
+            .json(&order)?;
 
         let mut attempt = 0;
         loop {
@@ -632,6 +639,197 @@ impl<'a> Trading<'a> {
                 .await;
             attempt += 1;
         }
+    }
+
+    /// Cancels one order named by your `client_order_id` (needs the trade scope). It is retried
+    /// like [`Trading::cancel_order`]: if a RETRY gets `INVALID_STATE`, the order is fetched by
+    /// `client_order_id` and returned instead of the error. Check the returned order's `status`.
+    /// The id is percent-encoded in the path.
+    pub async fn cancel_order_by_client_id(&self, client_order_id: &str) -> Result<Order> {
+        let o = self.c.resolved();
+        // No Idempotency-Key: the server does not honour one on cancels.
+        let call =
+            Call::new(OperationId::CancelOrderByClientId).path("client_order_id", client_order_id);
+        let mut attempt = 0;
+        loop {
+            let err = match self.c.t.attempt(&call, &o).await {
+                Ok(raw) => return decode_data(OperationId::CancelOrderByClientId, &raw),
+                Err(e) => e,
+            };
+            if attempt > 0 && err.api().is_some_and(|a| a.code == ErrorCode::InvalidState) {
+                return self.order_by_client_id(client_order_id).await;
+            }
+            if !err.is_retryable() || attempt >= o.max_retries {
+                return Err(err);
+            }
+            self.c
+                .t
+                .backoff(OperationId::CancelOrderByClientId, attempt, &err, None)
+                .await;
+            attempt += 1;
+        }
+    }
+
+    /// Places 1 to 20 REAL orders in one market (needs the trade scope), each on its own: the
+    /// batch is not atomic, and one refusal does not stop the rest.
+    ///
+    /// A `client_order_id` (a UUID) is generated for each order without one; your own ids must
+    /// be 1 to 64 characters of `A-Z a-z 0-9 _ - . :` and distinct. These checks fail locally,
+    /// before anything is sent.
+    ///
+    /// Retry safety: the body, ids included, is built once and every retry resends it
+    /// unchanged. The server refuses a repeated id, so nothing is placed twice. After a lost
+    /// answer, an order that the earlier attempt placed comes back as
+    /// [`PlaceOutcome::Recovered`] with its `order_id` and `status` (`rejected` means refused for
+    /// funds; its id is spent). A refusal of the whole batch (400, 403, 404) is returned and never
+    /// retried; a batch larger than the key's whole budget (400 with a number in
+    /// `details["limit"]`) must be split by the caller. A 429 is waited out and the same body
+    /// resent. Results are in request order; the counts are computed from them.
+    pub async fn place_orders(
+        &self,
+        symbol: &str,
+        orders: &[BatchOrderInput],
+    ) -> Result<BatchPlaceResult> {
+        if symbol.is_empty() {
+            return Err(Error::config("trading.place_orders: symbol is required"));
+        }
+        check_place(orders)?;
+        let mut items = Vec::with_capacity(orders.len());
+        for (i, o) in orders.iter().enumerate() {
+            check_amounts(
+                &format!("trading.place_orders: orders[{i}]"),
+                &[
+                    ("price", o.price.as_ref()),
+                    ("quantity", o.quantity.as_ref()),
+                    ("quote_quantity", o.quote_quantity.as_ref()),
+                    ("stop_price", o.stop_price.as_ref()),
+                ],
+            )?;
+            items.push(BatchOrderItem {
+                // Generated once, here: every attempt sends the same ids.
+                client_order_id: o.client_order_id.clone().unwrap_or_else(new_id),
+                side: o.side.clone(),
+                r#type: o.r#type.clone(),
+                price: o.price.clone(),
+                quantity: o.quantity.clone(),
+                quote_quantity: o.quote_quantity.clone(),
+                stop_price: o.stop_price.clone(),
+                time_in_force: o.time_in_force.clone(),
+                trigger_direction: o.trigger_direction.clone(),
+            });
+        }
+        let n = items.len() as u32;
+        let body = BatchOrderRequest {
+            symbol: symbol.to_string(),
+            orders: items,
+        };
+        let mut call = Call::new(OperationId::PlaceBatch)
+            .cost(n)
+            .order_actions(n)
+            .json(&body)?;
+        // No Idempotency-Key: the server does not honour one here (client_order_id does the job).
+        call.no_idempotency_key = true;
+        let mut attempts = Vec::new();
+        let raw = self
+            .c
+            .t
+            .request_noting(call, &self.c.resolved(), &mut attempts)
+            .await?;
+        let data: BatchOrder = decode_data(OperationId::PlaceBatch, &raw)?;
+        let after_ambiguous = attempts.contains(&Attempt::Ambiguous);
+        let mut results = Vec::with_capacity(data.results.len());
+        for r in data.results {
+            let mut o = place_from_result(r, after_ambiguous);
+            if needs_lookup(&o) {
+                o = self.recover_placed(o).await;
+            }
+            results.push(o);
+        }
+        Ok(place_result(results))
+    }
+
+    /// The server could not say what took this id: read it once, and never place it again.
+    async fn recover_placed(&self, mut o: BatchOrderOutcome) -> BatchOrderOutcome {
+        match self
+            .once()
+            .trading()
+            .order_by_client_id(&o.client_order_id)
+            .await
+        {
+            Ok(order) => {
+                o.order_id = Some(order.id.clone());
+                o.status = Some(order.status.clone());
+                o.order = Some(order);
+            }
+            Err(_) => {
+                o.outcome = PlaceOutcome::Unknown;
+                o.order_id = None;
+                o.status = None;
+            }
+        }
+        o
+    }
+
+    /// Cancels 1 to 50 orders (needs the trade scope), each named by
+    /// [`CancelBatchItem::by_order_id`] or [`CancelBatchItem::by_client_order_id`]. Each entry
+    /// is cancelled on its own, in order; a failure does not stop the rest.
+    ///
+    /// Retried like [`Trading::cancel_order`]: after a lost answer, an entry refused with
+    /// `INVALID_STATE` (an earlier attempt may have cancelled it) is looked up once and comes back
+    /// as [`CancelOutcome::Recovered`] with its current `status`. Results are in request order;
+    /// the counts are computed from them.
+    pub async fn cancel_orders(&self, orders: &[CancelBatchItem]) -> Result<BatchCancelResult> {
+        let entries = check_cancel(orders)?;
+        let n = entries.len() as u32;
+        let mut call = Call::new(OperationId::CancelBatch)
+            .cost(n)
+            .json(&CancelBatchRequest { orders: entries })?;
+        // No Idempotency-Key: the server does not honour one on cancels.
+        call.no_idempotency_key = true;
+        let mut attempts = Vec::new();
+        let raw = self
+            .c
+            .t
+            .request_noting(call, &self.c.resolved(), &mut attempts)
+            .await?;
+        let data: CancelBatch = decode_data(OperationId::CancelBatch, &raw)?;
+        let after_ambiguous = attempts.contains(&Attempt::Ambiguous);
+        let mut results = Vec::with_capacity(data.results.len());
+        for r in data.results {
+            let mut o = cancel_from_result(r, after_ambiguous);
+            if o.outcome == CancelOutcome::Recovered {
+                o = self.recover_cancelled(o).await;
+            }
+            results.push(o);
+        }
+        Ok(cancel_result(results))
+    }
+
+    async fn recover_cancelled(&self, mut o: CancelEntryOutcome) -> CancelEntryOutcome {
+        let c = self.once();
+        let t = c.trading();
+        let found = match (&o.order_id, &o.client_order_id) {
+            (Some(id), _) => t.order(id).await,
+            (None, Some(cid)) => t.order_by_client_id(cid).await,
+            (None, None) => Err(Error::config("no id to look up")),
+        };
+        match found {
+            Ok(order) => {
+                o.order_id = Some(order.id.clone());
+                o.status = Some(order.status.clone());
+                o.order = Some(order);
+            }
+            Err(_) => o.outcome = CancelOutcome::Unknown,
+        }
+        o
+    }
+
+    /// This service on a client that sends each call once (a batch's lookups are never retried).
+    fn once(&self) -> Client {
+        self.c.with_options(crate::CallOptions {
+            max_retries: Some(0),
+            ..self.c.opts.clone()
+        })
     }
 
     /// Cancels every open order in ONE market, such as `"BTC/USDT"`, in one request. An empty

@@ -291,6 +291,40 @@ impl fmt::Debug for ApiError {
     }
 }
 
+/// The `error` object of one item in a batch result ([`crate::BatchOrderResult`],
+/// [`crate::CancelBatchResult`]), as the server sent it. A whole response's error is an
+/// [`ApiError`] instead.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ErrorBody {
+    /// Machine-readable code. Branch on it, never on the message.
+    pub code: ErrorCode,
+    /// Human-readable; may change between releases.
+    pub message: String,
+    /// Whether an identical retry could succeed.
+    #[serde(default)]
+    pub retryable: bool,
+    /// Structured context: for `ALREADY_EXISTS`, the `order_id` and `status` of the order that
+    /// took the `client_order_id`.
+    #[serde(default)]
+    pub details: BTreeMap<String, Value>,
+    /// Per-field validation messages.
+    #[serde(default)]
+    pub fields: BTreeMap<String, String>,
+    /// Quote it in support requests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+}
+
+impl ErrorBody {
+    /// A string in `details`, if present and not empty.
+    pub fn detail_str(&self, name: &str) -> Option<&str> {
+        self.details
+            .get(name)
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+    }
+}
+
 /// The request produced no HTTP response.
 #[derive(Debug, Clone)]
 pub struct ConnectionError {

@@ -29,6 +29,9 @@ pub(crate) struct RateLimiter {
 
 struct Bucket {
     rpm: f64,
+    /// The most tokens it holds (the burst): `rpm` for the request limiter, one second's worth
+    /// for the order-actions budget.
+    cap: f64,
     tokens: f64,
     last: Instant,
     blocked_until: Option<Instant>,
@@ -36,11 +39,22 @@ struct Bucket {
 
 impl RateLimiter {
     pub(crate) fn new(rpm: u32, clock: Arc<dyn Clock>) -> Self {
+        Self::with_cap(rpm as f64, rpm as f64, clock)
+    }
+
+    /// A budget of `per_second` tokens a second that holds at most one second's worth (the
+    /// optional order-actions budget).
+    pub(crate) fn per_second(per_second: f64, clock: Arc<dyn Clock>) -> Self {
+        Self::with_cap(per_second * 60.0, per_second, clock)
+    }
+
+    fn with_cap(rpm: f64, cap: f64, clock: Arc<dyn Clock>) -> Self {
         let now = clock.now();
         RateLimiter {
             state: Mutex::new(Bucket {
-                rpm: rpm as f64,
-                tokens: rpm as f64,
+                rpm,
+                cap,
+                tokens: cap,
                 last: now,
                 blocked_until: None,
             }),
@@ -62,22 +76,29 @@ impl RateLimiter {
         }
     }
 
-    /// Waits until a request may be sent, then takes a token.
-    pub(crate) async fn acquire(&self) {
+    /// Waits until a request may be sent, then takes `cost` tokens (a batch of N takes N). A
+    /// cost above the bucket's size waits for a full bucket and leaves it in debt, so the calls
+    /// after it wait for the rest.
+    pub(crate) async fn acquire(&self, cost: u32) {
+        let cost = cost as f64;
         loop {
             let wait = {
                 let now = self.clock.now();
                 let mut b = self.state.lock().unwrap();
                 b.refill(now);
+                let need = cost.min(b.cap);
                 match b.blocked_until {
                     Some(u) if now < u => u - now,
-                    _ if b.tokens >= 1.0 => {
-                        b.tokens -= 1.0;
+                    // A nanosecond's worth of float error never makes a caller wait (a wait that
+                    // rounds to zero would never refill a fake clock).
+                    _ if b.tokens + 1e-9 >= need => {
+                        b.tokens -= cost;
                         return;
                     }
                     _ => {
                         let per_token = 60.0 / b.rpm;
-                        server_secs((1.0 - b.tokens) * per_token)
+                        server_secs((need - b.tokens) * per_token)
+                            .filter(|d| !d.is_zero())
                             .unwrap_or(Duration::from_millis(1))
                             .min(MAX_SERVER_WAIT)
                     }
@@ -98,6 +119,7 @@ impl RateLimiter {
             && limit < b.rpm
         {
             b.rpm = limit;
+            b.cap = b.cap.min(limit);
             b.tokens = b.tokens.min(limit);
         }
         let Some(remaining) = num(headers, "x-ratelimit-remaining") else {
@@ -122,11 +144,60 @@ impl RateLimiter {
     }
 }
 
+/// The hold an `order_actions` 429 puts on placements only: reads and cancels are not held.
+/// Capped at [`MAX_SERVER_WAIT`] like the limiter's own hold; a later, shorter hint never
+/// shortens it.
+pub(crate) struct PlacementHold {
+    until: Mutex<Option<Instant>>,
+    clock: Arc<dyn Clock>,
+}
+
+impl PlacementHold {
+    pub(crate) fn new(clock: Arc<dyn Clock>) -> Self {
+        PlacementHold {
+            until: Mutex::new(None),
+            clock,
+        }
+    }
+
+    /// Holds placements for `d`.
+    pub(crate) fn hold_for(&self, d: Duration) {
+        if d.is_zero() {
+            return;
+        }
+        let Some(until) = self.clock.now().checked_add(d.min(MAX_SERVER_WAIT)) else {
+            return;
+        };
+        let mut u = self.until.lock().unwrap();
+        if u.is_none_or(|cur| until > cur) {
+            *u = Some(until);
+        }
+    }
+
+    /// Waits until placements may be sent.
+    pub(crate) async fn wait(&self) {
+        let wait = {
+            let now = self.clock.now();
+            match *self.until.lock().unwrap() {
+                Some(u) if now < u => u - now,
+                _ => return,
+            }
+        };
+        self.clock.sleep(wait).await;
+    }
+
+    /// When the latest hold ends (`None`: never held).
+    #[cfg(test)]
+    pub(crate) fn held_until(&self) -> Option<Instant> {
+        *self.until.lock().unwrap()
+    }
+}
+
 impl Bucket {
     fn refill(&mut self, now: Instant) {
         if now > self.last {
             let elapsed = (now - self.last).as_secs_f64() / 60.0;
-            self.tokens = self.rpm.min(self.tokens + elapsed * self.rpm);
+            self.tokens = self.cap.min(self.tokens + elapsed * self.rpm);
             self.last = now;
         }
     }
@@ -187,14 +258,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_cost_above_the_bucket_leaves_a_debt() {
+        let clock = FakeClock::default();
+        let l = RateLimiter::per_second(3.0, Arc::new(clock.clone()));
+        l.acquire(5).await; // a full bucket (3) is enough to start; 2 are owed
+        assert!(clock.sleeps().is_empty());
+        l.acquire(1).await; // 3 tokens at 3 a second
+        assert_eq!(clock.sleeps(), vec![Duration::from_secs(1)]);
+    }
+
+    #[tokio::test]
+    async fn fractional_rates_never_sleep_zero() {
+        let clock = FakeClock::default();
+        let l = RateLimiter::new(7, Arc::new(clock.clone()));
+        for _ in 0..50 {
+            l.acquire(3).await;
+        }
+        let sleeps = clock.sleeps();
+        assert!(sleeps.len() < 60, "{}", sleeps.len());
+        assert!(sleeps.iter().all(|d| !d.is_zero()));
+    }
+
+    #[tokio::test]
     async fn spends_tokens_then_waits() {
         let clock = FakeClock::default();
         let l = RateLimiter::new(60, Arc::new(clock.clone()));
         for _ in 0..60 {
-            l.acquire().await;
+            l.acquire(1).await;
         }
         assert!(clock.sleeps().is_empty());
-        l.acquire().await;
+        l.acquire(1).await;
         assert_eq!(clock.sleeps(), vec![Duration::from_secs(1)]);
     }
 
@@ -210,7 +303,7 @@ mod tests {
         let s = l.state();
         assert_eq!(s.requests_per_minute, 120.0);
         assert_eq!(s.blocked_for, Duration::from_secs(7));
-        l.acquire().await;
+        l.acquire(1).await;
         assert_eq!(clock.sleeps()[0], Duration::from_secs(7));
     }
 
@@ -227,8 +320,8 @@ mod tests {
         }
         l.block_for(Duration::MAX);
         assert!(l.state().blocked_for <= MAX_SERVER_WAIT);
-        l.acquire().await;
-        l.acquire().await;
+        l.acquire(1).await;
+        l.acquire(1).await;
         assert!(clock.sleeps().iter().all(|d| *d <= MAX_SERVER_WAIT));
     }
 

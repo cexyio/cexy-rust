@@ -6,6 +6,28 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- `Trading::place_orders(symbol, orders)`: up to 20 orders in one market in one request
+  (`POST /trading/orders/batch`), each a `BatchOrderInput`. Not atomic; results in request order,
+  each `Placed`, `Failed`, `Recovered` or `Unknown` (`BatchPlaceResult`, `BatchOrderOutcome`,
+  `PlaceOutcome`). A `client_order_id` is generated for each order without one, before the first
+  attempt; a retry resends the same body. After a lost answer, an order the earlier attempt placed
+  is reported `Recovered` from the server's `ALREADY_EXISTS` details (looked up once by client
+  order id if they are missing), never placed again.
+- `Trading::cancel_orders(orders)`: up to 50 cancels by `order_id` or `client_order_id`
+  (`POST /trading/orders/cancel-batch`, `CancelBatchItem::by_order_id` /
+  `CancelBatchItem::by_client_order_id`, `BatchCancelResult`, `CancelEntryOutcome`,
+  `CancelOutcome`).
+- `Trading::cancel_order_by_client_id(client_order_id)` (`DELETE /trading/orders/by-client-id/{id}`).
+- `ClientOptions::order_actions_per_second`: an optional client-side budget for placements.
+- `ErrorBody`: a batch item's error as the server sent it.
+- `ApiKey::rate_tier` (`default` or `mm`).
+- Shared conformance cases: `trading/batch_orders.json`.
+
+### Changed
+- A batch takes one limiter token per order or entry.
+- A 429 with `details.limit` `order_actions` holds only placements for its wait, not the whole client.
+
 ## [0.1.0-dev.12] (2026-10-09)
 
 ### Changed

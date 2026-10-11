@@ -107,6 +107,49 @@ add it to `locked` or `total` again. There are at most 100 entries, soonest `ava
 released (the amount moves to `available`) or cancelled by the exchange. It is always a `Vec`
 (empty when none, including from servers that predate the field).
 
+### Batch orders
+
+Place up to 20 orders in one market with one request, or cancel up to 50:
+
+```rust
+# async fn run(c: cexy::Client) -> cexy::Result<()> {
+use cexy::{Amount, BatchOrderInput, CancelBatchItem, OrderSide, OrderType};
+let mut buy = BatchOrderInput::new(OrderSide::Buy, OrderType::Limit);
+buy.price = Some(Amount::new("64000")?);
+buy.quantity = Some(Amount::new("0.01")?);
+let mut sell = BatchOrderInput::new(OrderSide::Sell, OrderType::Limit);
+sell.price = Some(Amount::new("66000")?);
+sell.quantity = Some(Amount::new("0.01")?);
+let res = c.trading().place_orders("BTC/USDT", &[buy, sell]).await?;
+for o in &res.results {
+    // request order
+    println!("{} {} {:?} {:?} {:?} {:?}", o.index, o.client_order_id, o.outcome, o.order_id, o.status, o.error);
+}
+
+c.trading()
+    .cancel_orders(&[CancelBatchItem::by_order_id("..."), CancelBatchItem::by_client_order_id("...")])
+    .await?;
+c.trading().cancel_order_by_client_id("my-id-1").await?;
+# Ok(()) }
+```
+
+- Each order is placed (or cancelled) on its own: the batch is **not atomic**, and one refusal does
+  not stop the rest. Each result's `outcome` is `Placed` (or `Cancelled`), `Failed` with `error`,
+  `Recovered` or `Unknown` (below). The counts on the result are computed from the results.
+- Every order carries a `client_order_id`; one (a UUID) is generated for each order without one.
+  Your own ids must be 1 to 64 characters of `A-Z a-z 0-9 _ - . :`, distinct within the batch, and
+  unique per account across all markets.
+- **Retries:** the request body is built once; a retry after a timeout resends it unchanged, and the
+  server refuses every id it already placed, so nothing is placed twice. Such an order comes back as
+  `Recovered` with its `order_id` and `status`. A `rejected` status means the server refused it for
+  funds and its id is spent: do not place it again under that id. `Unknown` means its state could
+  not be read; it was not placed again (look it up with `order_by_client_id`). A cancel that a retry
+  finds already closed is looked up and comes back as `Recovered` with its current status.
+- A whole batch is refused, with nothing placed, for a bad request (400), a market that does not
+  exist (404), an account that may not trade (403) or a spent budget (429, waited out and resent).
+  A batch larger than the key's whole budget is a 400 with a number in `details["limit"]`: send
+  fewer at a time. The SDK never splits a batch.
+
 ### Market buys by total
 
 A market buy can name a budget, `quote_quantity`, instead of a `quantity`: "spend at most this
@@ -203,6 +246,13 @@ match c.trading().place_order(&order).await {
   against its IP's failed-key limit (120 a minute) and can lock out every other key on that IP. Market makers:
   run the cancel/risk key from its own egress IP; a separate key on the same IP is not isolated.
 - A 429 waits at least `Retry-After` / `details.retry_after_seconds`.
+- **Batches and order budgets.** A batch of N orders or cancel entries takes N tokens from the
+  client's limiter, as the server counts it. A market maker's key also has an order budget of 50
+  placements a second (per key and per account); cancels never count against it. A 429 whose
+  `details["limit"]` is `"order_actions"` holds only **placements** (`place_order`, `place_orders`)
+  for its wait: reads and cancels keep going. Set `ClientOptions::order_actions_per_second` to
+  `Some(50.0)` to keep placements under that budget locally instead of being refused (off by
+  default).
 - GETs retry freely.
 - **Orders:** safety rests on `client_order_id`, not on `Idempotency-Key` (the server does not honour
   that header on orders, order cancels or cancel-all, so the SDK sends it only on pool join and exit). `place_order` always sends a `client_order_id`
