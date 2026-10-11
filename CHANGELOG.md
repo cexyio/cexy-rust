@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-dev.13] (2026-10-11)
+
 ### Added
 - `Trading::place_orders(symbol, orders)`: up to 20 orders in one market in one request
   (`POST /trading/orders/batch`), each a `BatchOrderInput`. Not atomic; results in request order,
@@ -40,6 +42,7 @@ All notable changes to this project are documented here. The format follows
 - A batch takes one limiter token per order or entry.
 - A 429 with `details.limit` `order_actions` holds only placements for its wait, not the whole client.
 - A placement waiting out an `order_actions` hold checks it again after the wait.
+- Built against cexy-api-spec `944581d` (batch orders, `client_order_id` pattern).
 
 ## [0.1.0-dev.12] (2026-10-09)
 
