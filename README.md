@@ -141,7 +141,9 @@ c.trading().cancel_order_by_client_id("my-id-1").await?;
   unique per account across all markets.
 - **Retries:** the request body is built once; a retry after a timeout resends it unchanged, and the
   server refuses every id it already placed, so nothing is placed twice. Such an order comes back as
-  `Recovered` with its `order_id` and `status`. A `rejected` status means the server refused it for
+  `Recovered` with its `order_id` and `status`. A recovered order counts as placed unless its status
+  is `rejected`, even if it ended `cancelled` with nothing filled: read `status` before acting. A
+  `rejected` status means the server refused it for
   funds and its id is spent: do not place it again under that id. `Unknown` means its state could
   not be read; it was not placed again (look it up with `order_by_client_id`). A cancel that a retry
   finds already closed is looked up and comes back as `Recovered` with its current status.
