@@ -410,11 +410,10 @@ async fn conformance_cancel() {
         let server = MockServer::start().await;
         mount_case(&server, "POST", CANCEL_BATCH, case, template).await;
         let (c, _) = batch_client(&server, |_| {});
-        let r = c
+        let result = c
             .trading()
             .cancel_orders(&cancel_inputs(&case["request"]))
-            .await
-            .unwrap_or_else(|e| panic!("{id}: {e}"));
+            .await;
         let reqs = server.received_requests().await.unwrap();
         let sent = calls_to(&reqs, "POST", CANCEL_BATCH);
         assert_eq!(
@@ -422,6 +421,13 @@ async fn conformance_cancel() {
             expect["calls"].as_u64().unwrap(),
             "{id}: calls"
         );
+        // Rule 13: a result that does not match the entries sent is a bad response.
+        if expect["error"] == json!("bad_response") {
+            let e = result.expect_err(id);
+            assert!(matches!(e, Error::Decode(_)), "{id}: {e}");
+            continue;
+        }
+        let r = result.unwrap_or_else(|e| panic!("{id}: {e}"));
         if expect["same_body"] == json!(true) {
             same_bodies(&sent, id);
         }
@@ -978,4 +984,67 @@ fn new_client_order_id_is_a_fresh_uuid() {
     assert_eq!(a.len(), 36);
     assert_ne!(a, b);
     assert!(crate::batch::valid_client_order_id(&a));
+}
+
+/// Signs batch calls but fails on every GET: the recovery lookup fails inside the
+/// authenticator, not on the wire.
+struct FailingOnGets;
+
+impl crate::Authenticator for FailingOnGets {
+    fn kind(&self) -> &str {
+        "test"
+    }
+    fn authenticate(&self, request: &mut crate::AuthRequest<'_>) -> crate::Result<()> {
+        if request.method == "GET" {
+            return Err(Error::Config("authenticator refused".into()));
+        }
+        Ok(())
+    }
+    fn redact(&self, text: &str) -> String {
+        text.to_string()
+    }
+}
+
+/// Rule 12: a lookup that fails in any way (here the authenticator) makes the item `Unknown`, in
+/// place and in cancel, and the call still returns.
+#[tokio::test]
+async fn a_lookup_failing_in_the_authenticator_is_unknown() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(BATCH))
+        .respond_with(data(json!({"placed": 0, "failed": 1, "results": [{
+            "index": 0, "client_order_id": "c1", "order": null, "fills": [],
+            "error": {"code": "INTERNAL", "message": "internal", "retryable": false}}]})))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(CANCEL_BATCH))
+        .respond_with(Sequence::new(vec![
+            api_error(502, "SERVICE_UNAVAILABLE", true),
+            data(json!({"cancelled": 0, "failed": 1, "results": [{
+                "index": 0, "order_id": "o1", "client_order_id": null, "order": null,
+                "error": {"code": "INVALID_STATE", "message": "closed", "retryable": false}}]})),
+        ]))
+        .mount(&server)
+        .await;
+    let (c, _) = batch_client(&server, |o| {
+        o.api_key = None;
+        o.api_secret = None;
+        o.authenticator = Some(Arc::new(FailingOnGets));
+    });
+    let mut o = limit_buy();
+    o.client_order_id = Some("c1".into());
+    let r = c.trading().place_orders("BTC/USDT", &[o]).await.unwrap();
+    assert_eq!(r.results[0].outcome, PlaceOutcome::Unknown);
+    assert_eq!((r.placed, r.failed, r.unknown), (0, 0, 1));
+    let r = c
+        .trading()
+        .cancel_orders(&[CancelBatchItem::by_order_id("o1")])
+        .await
+        .unwrap();
+    assert_eq!(r.results[0].outcome, crate::CancelOutcome::Unknown);
+    assert_eq!((r.cancelled, r.failed, r.unknown), (0, 0, 1));
+    // Nothing reached the server for the lookups.
+    let reqs = server.received_requests().await.unwrap();
+    assert!(reqs.iter().all(|r| r.method.as_str() == "POST"));
 }

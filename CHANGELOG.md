@@ -31,7 +31,10 @@ All notable changes to this project are documented here. The format follows
 - A 200 that cannot be used (no `data`, undecodable, or results not matching the request) is
   treated as ambiguous; `cancel_orders` returns a decode error for a mismatch.
 - `.` and `..` are refused as client order ids, locally.
-- Shared conformance cases: `trading/batch_orders.json` (cexy-api-spec a718d07).
+- A `details.status` of `"unknown"` counts as missing, so the order is looked up; a recovery
+  lookup that fails in any way (an API or network error, a 200 that is not an order, the
+  authenticator) makes the item `Unknown` and the call still returns.
+- Shared conformance cases: `trading/batch_orders.json` (cexy-api-spec ff1fc42).
 
 ### Changed
 - A batch takes one limiter token per order or entry.

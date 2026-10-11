@@ -275,7 +275,7 @@ pub(crate) fn place_from_result(r: BatchOrderResult, after_ambiguous: bool) -> B
         (_, Some(err)) if after_ambiguous && err.code == ErrorCode::AlreadyExists => {
             o.outcome = PlaceOutcome::Recovered;
             o.order_id = err.detail_str("order_id").map(str::to_string);
-            o.status = err.detail_str("status").map(OrderStatus::from);
+            o.status = detail_status(err);
             o.fills = vec![];
         }
         // On any attempt: an error naming an order (MARKET_UNAVAILABLE when the market stopped
@@ -287,12 +287,20 @@ pub(crate) fn place_from_result(r: BatchOrderResult, after_ambiguous: bool) -> B
         {
             o.outcome = PlaceOutcome::Recovered;
             o.order_id = err.detail_str("order_id").map(str::to_string);
-            o.status = err.detail_str("status").map(OrderStatus::from);
+            o.status = detail_status(err);
             o.fills = vec![];
         }
         _ => {}
     }
     o
+}
+
+/// `details.status` of an item error. `"unknown"` (the server could not read it) counts as
+/// missing, so the order is looked up.
+fn detail_status(err: &ErrorBody) -> Option<OrderStatus> {
+    err.detail_str("status")
+        .filter(|s| *s != "unknown")
+        .map(OrderStatus::from)
 }
 
 pub(crate) fn needs_lookup(o: &BatchOrderOutcome) -> bool {
