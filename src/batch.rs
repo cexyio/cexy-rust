@@ -180,11 +180,25 @@ pub struct BatchCancelResult {
 
 /// The server's rule for a client order id. It trims surrounding whitespace; the SDK refuses
 /// it instead, so the id in a result is always the one sent.
+/// `.` and `..` are refused too: the server accepts them, but they cannot be a path segment, so
+/// the order could never be looked up by its id.
 pub(crate) fn valid_client_order_id(cid: &str) -> bool {
     (1..=64).contains(&cid.len())
+        && !is_dot_segment(cid)
         && cid
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b':'))
+}
+
+fn is_dot_segment(id: &str) -> bool {
+    id == "." || id == ".."
+}
+
+/// A new `client_order_id` (a UUID v4), as `place_order` and `place_orders` generate for an
+/// order without one. Create and save your ids with it before the call when you need to
+/// reconcile after an error: a dropped future returns nothing.
+pub fn new_client_order_id() -> String {
+    crate::transport::new_id()
 }
 
 pub(crate) fn check_place(orders: &[BatchOrderInput]) -> Result<()> {
@@ -227,6 +241,9 @@ pub(crate) fn check_cancel(entries: &[CancelBatchItem]) -> Result<Vec<CancelBatc
         .enumerate()
         .map(|(i, e)| match (nonempty(&e.order_id), nonempty(&e.client_order_id)) {
             (Some(id), None) => Ok(CancelBatchItem::by_order_id(id)),
+            (None, Some(cid)) if is_dot_segment(&cid) => Err(Error::config(format!(
+                "trading.cancel_orders: orders[{i}]: client_order_id must not be \".\" or \"..\""
+            ))),
             (None, Some(cid)) => Ok(CancelBatchItem::by_client_order_id(cid)),
             _ => Err(Error::config(format!(
                 "trading.cancel_orders: orders[{i}]: give exactly one of order_id and client_order_id"
@@ -254,7 +271,20 @@ pub(crate) fn place_from_result(r: BatchOrderResult, after_ambiguous: bool) -> B
             o.status = Some(order.status.clone());
             o.order = Some(order);
         }
+        // An earlier attempt of this call placed it (its answer was lost).
         (_, Some(err)) if after_ambiguous && err.code == ErrorCode::AlreadyExists => {
+            o.outcome = PlaceOutcome::Recovered;
+            o.order_id = err.detail_str("order_id").map(str::to_string);
+            o.status = err.detail_str("status").map(OrderStatus::from);
+            o.fills = vec![];
+        }
+        // On any attempt: an error naming an order (MARKET_UNAVAILABLE when the market stopped
+        // while matching) means the order exists; an INTERNAL may follow a committed order and
+        // is looked up. ALREADY_EXISTS on a first attempt is the caller's reused id.
+        (_, Some(err))
+            if err.code != ErrorCode::AlreadyExists
+                && (err.detail_str("order_id").is_some() || err.code == ErrorCode::Internal) =>
+        {
             o.outcome = PlaceOutcome::Recovered;
             o.order_id = err.detail_str("order_id").map(str::to_string);
             o.status = err.detail_str("status").map(OrderStatus::from);
@@ -267,6 +297,32 @@ pub(crate) fn place_from_result(r: BatchOrderResult, after_ambiguous: bool) -> B
 
 pub(crate) fn needs_lookup(o: &BatchOrderOutcome) -> bool {
     o.outcome == PlaceOutcome::Recovered && (o.order_id.is_none() || o.status.is_none())
+}
+
+/// Whether a place answer matches the request: one result per order sent, in order, each with
+/// its index and `client_order_id`.
+pub(crate) fn place_matches(sent: &[String], results: &[BatchOrderResult]) -> bool {
+    results.len() == sent.len()
+        && results
+            .iter()
+            .zip(sent)
+            .enumerate()
+            .all(|(i, (r, cid))| r.index == i as i64 && &r.client_order_id == cid)
+}
+
+/// Whether a cancel answer matches the request: one result per entry, in order, echoing the
+/// entry's id where it echoes one.
+pub(crate) fn cancel_matches(sent: &[CancelBatchItem], results: &[CancelBatchResult]) -> bool {
+    // Only the id the entry was sent with is compared: the other may name the order found.
+    let same = |echo: &Option<String>, sent: &Option<String>| {
+        sent.is_none() || echo.is_none() || echo == sent
+    };
+    results.len() == sent.len()
+        && results.iter().zip(sent).enumerate().all(|(i, (r, e))| {
+            r.index == i as i64
+                && same(&r.order_id, &e.order_id)
+                && same(&r.client_order_id, &e.client_order_id)
+        })
 }
 
 /// Reads one entry. A recovered entry still needs its lookup.

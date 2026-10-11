@@ -67,17 +67,20 @@ pub(crate) struct Call {
 /// How a failed attempt ended, as the batch calls need to know it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Attempt {
-    /// The server may have acted: a connection error or timeout, or HTTP 500, 502 or 504.
+    /// The server may have acted: a connection error or timeout, any HTTP 5xx except 501 and
+    /// 503 (Cloudflare's 520 and 524 included), or a 2xx that is not JSON.
     Ambiguous,
-    /// It did not: a 429, a 503 or any other refusal.
+    /// It did not: a 429, a 501, a 503 or any other 4xx.
     Refused,
 }
 
 impl Attempt {
     pub(crate) fn of(e: &Error) -> Attempt {
         match e {
-            Error::Connection(_) => Attempt::Ambiguous,
-            Error::Api(a) if matches!(a.status, 500 | 502 | 504) => Attempt::Ambiguous,
+            Error::Connection(_) | Error::Decode(_) => Attempt::Ambiguous,
+            Error::Api(a) if a.status >= 500 && !matches!(a.status, 501 | 503) => {
+                Attempt::Ambiguous
+            }
             _ => Attempt::Refused,
         }
     }

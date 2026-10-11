@@ -54,6 +54,27 @@ pub enum Error {
         source: Box<Error>,
     },
 
+    /// [`crate::Trading::place_orders`] failed after building its request: the request may have
+    /// been sent, so some orders may be live. `client_order_ids` are every id of the request,
+    /// generated ones included, in request order: look each one up with
+    /// [`crate::Trading::order_by_client_id`], or send the same orders again WITH these ids (the
+    /// server refuses an id it already placed as `ALREADY_EXISTS`), before placing anything anew.
+    /// `maybe_placed` is false only when every attempt was a definite refusal (a 429, 501, 503 or
+    /// another 4xx), so nothing was placed. [`Error::api`] and [`Error::code`] read `source`.
+    #[error(
+        "cexy: place_orders failed (maybe_placed: {maybe_placed}, {} client_order_ids): {source}",
+        .client_order_ids.len()
+    )]
+    BatchPlace {
+        /// Every `client_order_id` sent, in request order.
+        client_order_ids: Vec<String>,
+        /// Whether any order may have been placed.
+        maybe_placed: bool,
+        /// The failure: an API error, a connection error or timeout, or a [`Error::Decode`] for an
+        /// unusable 200.
+        source: Box<Error>,
+    },
+
     /// `cancel_all_until_done` stopped on an error; `summary` holds what the earlier rounds did.
     #[error("cexy: cancel-all interrupted after {} round(s): {source}", .summary.rounds)]
     CancelAllInterrupted {
@@ -111,10 +132,11 @@ pub const PAGING_STALLED: &str = "PAGING_STALLED";
 pub const PAGING_CURSOR_REPEATED: &str = "PAGING_CURSOR_REPEATED";
 
 impl Error {
-    /// The API error, if this is one.
+    /// The API error, if this is one (for [`Error::BatchPlace`], its source's).
     pub fn api(&self) -> Option<&ApiError> {
         match self {
             Error::Api(e) => Some(e),
+            Error::BatchPlace { source, .. } => source.api(),
             _ => None,
         }
     }
@@ -129,6 +151,7 @@ impl Error {
     pub fn code(&self) -> Option<&str> {
         match self {
             Error::Api(e) => Some(e.code.as_str()),
+            Error::BatchPlace { source, .. } => source.code(),
             Error::WebSocket(e) => Some(&e.code),
             Error::PagingStalled { .. } => Some(PAGING_STALLED),
             Error::PagingCursorRepeated { .. } => Some(PAGING_CURSOR_REPEATED),

@@ -53,7 +53,11 @@ fn reply(item: &Value, template: &Value, echo: Option<&Value>) -> ResponseTempla
         return ResponseTemplate::new(200).set_delay(TIMEOUT * 10);
     }
     let status = item["http_status"].as_u64().unwrap() as u16;
-    let mut t = if let Some(err) = item.get("error") {
+    let mut t = if let Some(text) = item.get("text") {
+        ResponseTemplate::new(status).set_body_raw(text.as_str().unwrap().as_bytes(), "text/html")
+    } else if let Some(body) = item.get("body") {
+        ResponseTemplate::new(status).set_body_json(body.clone())
+    } else if let Some(err) = item.get("error") {
         ResponseTemplate::new(status).set_body_json(json!({ "error": err }))
     } else {
         let mut d = item["data"].clone();
@@ -93,6 +97,36 @@ impl Respond for Attempts {
             .unwrap_or_else(|| panic!("attempt {i} not expected"));
         let body: Option<Value> = serde_json::from_slice(&req.body).ok();
         reply(item, &self.template, body.as_ref())
+    }
+}
+
+/// Answers a batch place or cancel with every item done, matching the request.
+struct Echo;
+
+impl Respond for Echo {
+    fn respond(&self, req: &Request) -> ResponseTemplate {
+        let b: Value = serde_json::from_slice(&req.body).unwrap();
+        let items = b["orders"].as_array().unwrap();
+        let results: Vec<Value> = items
+            .iter()
+            .enumerate()
+            .map(|(i, it)| {
+                if b.get("symbol").is_some() {
+                    json!({"index": i, "client_order_id": it["client_order_id"],
+                        "order": order(&format!("o{i}"), "open"), "fills": [], "error": null})
+                } else {
+                    json!({"index": i, "order_id": it.get("order_id"),
+                        "client_order_id": it.get("client_order_id"),
+                        "order": order(&format!("o{i}"), "cancelled"), "error": null})
+                }
+            })
+            .collect();
+        let n = results.len();
+        if b.get("symbol").is_some() {
+            data(json!({"placed": n, "failed": 0, "results": results}))
+        } else {
+            data(json!({"cancelled": n, "failed": 0, "results": results}))
+        }
     }
 }
 
@@ -193,7 +227,26 @@ fn same_bodies(reqs: &[&Request], id: &str) {
     );
 }
 
-fn check_error(id: &str, e: &Error, expect: &Value) {
+/// The ids of the first request body, in order.
+fn first_body_cids(sent: &[&Request]) -> Vec<String> {
+    let b: Value = serde_json::from_slice(&sent[0].body).unwrap();
+    b["orders"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|o| o["client_order_id"].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// The error a place_orders failure is wrapped in, or `e` itself.
+fn cause_of(e: &Error) -> &Error {
+    match e {
+        Error::BatchPlace { source, .. } => source,
+        other => other,
+    }
+}
+
+fn check_error(id: &str, e: &Error, expect: &Value, sent: &[&Request]) {
     if let Some(code) = expect["error_code"].as_str() {
         assert_eq!(e.code(), Some(code), "{id}: {e}");
     }
@@ -201,7 +254,37 @@ fn check_error(id: &str, e: &Error, expect: &Value) {
         assert_eq!(&e.api().unwrap().details["limit"], limit, "{id}");
     }
     if expect["error"] == json!("connection") {
-        assert!(matches!(e, Error::Connection(_)), "{id}: {e}");
+        assert!(matches!(cause_of(e), Error::Connection(_)), "{id}: {e}");
+    }
+    if expect["error"] == json!("batch") {
+        let Error::BatchPlace {
+            client_order_ids,
+            maybe_placed,
+            source,
+        } = e
+        else {
+            panic!("{id}: not a batch error: {e}");
+        };
+        if let Some(m) = expect["maybe_placed"].as_bool() {
+            assert_eq!(*maybe_placed, m, "{id}: maybe_placed");
+        }
+        if expect["error_cids"] == json!("sent") {
+            assert_eq!(client_order_ids, &first_body_cids(sent), "{id}: cids");
+        }
+        for i in expect["generated_cid_indexes"]
+            .as_array()
+            .into_iter()
+            .flatten()
+        {
+            let cid = &client_order_ids[i.as_u64().unwrap() as usize];
+            assert_eq!(cid.len(), 36, "{id}: generated {cid}");
+        }
+        match expect["cause"].as_str() {
+            Some("connection") => assert!(matches!(**source, Error::Connection(_)), "{id}: {e}"),
+            Some("bad_response") => assert!(matches!(**source, Error::Decode(_)), "{id}: {e}"),
+            Some(code) => assert_eq!(source.code(), Some(code), "{id}: {e}"),
+            None => {}
+        }
     }
 }
 
@@ -249,7 +332,7 @@ async fn conformance_place() {
         }
         check_hold(id, &c, expect);
         let Some(want) = expect["results"].as_array() else {
-            check_error(id, &result.expect_err(id), expect);
+            check_error(id, &result.expect_err(id), expect, &sent);
             continue;
         };
         let r = result.unwrap_or_else(|e| panic!("{id}: {e}"));
@@ -428,7 +511,7 @@ async fn conformance_cancel_by_client_id() {
                     "{id}"
                 );
             }
-            None => check_error(id, &result.expect_err(id), expect),
+            None => check_error(id, &result.expect_err(id), expect, &sent),
         }
     }
 }
@@ -442,12 +525,12 @@ async fn conformance_local_checks_and_paths() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path(BATCH))
-        .respond_with(data(json!({"placed": 0, "failed": 0, "results": []})))
+        .respond_with(Echo)
         .mount(&server)
         .await;
     Mock::given(method("POST"))
         .and(path(CANCEL_BATCH))
-        .respond_with(data(json!({"cancelled": 0, "failed": 0, "results": []})))
+        .respond_with(Echo)
         .mount(&server)
         .await;
     Mock::given(method("DELETE"))
@@ -526,17 +609,14 @@ async fn conformance_cost() {
     let template = &file["order_template"];
     let order = overlay(template, &json!({"id": "o1"}));
     let server = MockServer::start().await;
+    for p in [BATCH, CANCEL_BATCH] {
+        Mock::given(method("POST"))
+            .and(path(p))
+            .respond_with(Echo)
+            .mount(&server)
+            .await;
+    }
     for (verb, p, body) in [
-        (
-            "POST",
-            BATCH,
-            json!({"placed": 0, "failed": 0, "results": []}),
-        ),
-        (
-            "POST",
-            CANCEL_BATCH,
-            json!({"cancelled": 0, "failed": 0, "results": []}),
-        ),
         (
             "POST",
             "/api/v1/trading/orders",
@@ -618,7 +698,7 @@ fn rate_limited(limit: Option<&str>) -> ResponseTemplate {
 }
 
 /// Mounts answers for every call the hold tests make; the batch place answers `first`.
-async fn hold_server(first: ResponseTemplate) -> MockServer {
+async fn hold_server(first: impl Respond + 'static) -> MockServer {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path(BATCH))
@@ -632,7 +712,7 @@ async fn hold_server(first: ResponseTemplate) -> MockServer {
         .await;
     Mock::given(method("POST"))
         .and(path(CANCEL_BATCH))
-        .respond_with(data(json!({"cancelled": 0, "failed": 0, "results": []})))
+        .respond_with(Echo)
         .mount(&server)
         .await;
     Mock::given(method("DELETE"))
@@ -703,7 +783,7 @@ async fn request_limit_429_still_holds_everything() {
 
 #[tokio::test]
 async fn a_batch_takes_n_request_tokens() {
-    let server = hold_server(data(json!({"placed": 0, "failed": 0, "results": []}))).await;
+    let server = hold_server(Echo).await;
     // 20 a minute: one token every 3 s. A batch of 20 spends them all, so the next read waits.
     let (c, clock) = batch_client(&server, |o| o.requests_per_minute = Some(20));
     let twenty: Vec<_> = (0..20).map(|_| limit_buy()).collect();
@@ -715,7 +795,7 @@ async fn a_batch_takes_n_request_tokens() {
 
 #[tokio::test]
 async fn a_cancel_batch_takes_n_request_tokens() {
-    let server = hold_server(data(json!({}))).await;
+    let server = hold_server(Echo).await;
     let (c, clock) = batch_client(&server, |o| o.requests_per_minute = Some(50));
     let fifty: Vec<_> = (0..50)
         .map(|i| CancelBatchItem::by_order_id(format!("o{i}")))
@@ -730,7 +810,7 @@ async fn a_cancel_batch_takes_n_request_tokens() {
 
 #[tokio::test]
 async fn order_actions_budget_spends_placements_only() {
-    let server = hold_server(data(json!({"placed": 0, "failed": 0, "results": []}))).await;
+    let server = hold_server(Echo).await;
     let (c, clock) = batch_client(&server, |o| o.order_actions_per_second = Some(2.0));
     let t = c.trading();
     t.place_orders("BTC/USDT", &[limit_buy(), limit_buy()])
@@ -872,4 +952,30 @@ async fn a_failed_lookup_leaves_the_other_items_intact() {
     assert_eq!((r.placed, r.failed, r.unknown), (2, 0, 1));
     let reqs = server.received_requests().await.unwrap();
     assert_eq!(lookups(&reqs), vec!["cid:c1", "cid:c2"]);
+}
+
+#[tokio::test]
+async fn a_cancel_answer_that_does_not_match_is_an_error() {
+    let server = MockServer::start().await;
+    Mock::given(any())
+        .respond_with(data(json!({"cancelled": 1, "failed": 0, "results": [
+            {"index": 0, "order_id": "other", "client_order_id": null,
+             "order": order("other", "cancelled"), "error": null}]})))
+        .mount(&server)
+        .await;
+    let (c, _) = batch_client(&server, |_| {});
+    let e = c
+        .trading()
+        .cancel_orders(&[CancelBatchItem::by_order_id("o1")])
+        .await
+        .unwrap_err();
+    assert!(matches!(e, Error::Decode(_)), "{e}");
+}
+
+#[test]
+fn new_client_order_id_is_a_fresh_uuid() {
+    let (a, b) = (crate::new_client_order_id(), crate::new_client_order_id());
+    assert_eq!(a.len(), 36);
+    assert_ne!(a, b);
+    assert!(crate::batch::valid_client_order_id(&a));
 }

@@ -174,16 +174,19 @@ impl PlacementHold {
         }
     }
 
-    /// Waits until placements may be sent.
+    /// Waits until placements may be sent, checking again after each wait (a 429 during the
+    /// wait may have extended the hold).
     pub(crate) async fn wait(&self) {
-        let wait = {
-            let now = self.clock.now();
-            match *self.until.lock().unwrap() {
-                Some(u) if now < u => u - now,
-                _ => return,
-            }
-        };
-        self.clock.sleep(wait).await;
+        loop {
+            let wait = {
+                let now = self.clock.now();
+                match *self.until.lock().unwrap() {
+                    Some(u) if now < u => u - now,
+                    _ => return,
+                }
+            };
+            self.clock.sleep(wait).await;
+        }
     }
 
     /// When the latest hold ends (`None`: never held).

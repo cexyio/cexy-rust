@@ -22,11 +22,21 @@ All notable changes to this project are documented here. The format follows
 - `ClientOptions::order_actions_per_second`: an optional client-side budget for placements.
 - `ErrorBody`: a batch item's error as the server sent it.
 - `ApiKey::rate_tier` (`default` or `mm`).
-- Shared conformance cases: `trading/batch_orders.json`.
+- `Error::BatchPlace`: any `place_orders` failure after its request is built carries every
+  `client_order_id` sent (generated ones included) and `maybe_placed`, with the cause as `source`.
+- `new_client_order_id()`: the generator `place_order` and `place_orders` use, to create and save
+  ids before a call.
+- An item error with `details.order_id` (such as `MARKET_UNAVAILABLE`) is reported `Recovered` on
+  any attempt; an item `INTERNAL` is looked up once by client order id.
+- A 200 that cannot be used (no `data`, undecodable, or results not matching the request) is
+  treated as ambiguous; `cancel_orders` returns a decode error for a mismatch.
+- `.` and `..` are refused as client order ids, locally.
+- Shared conformance cases: `trading/batch_orders.json` (cexy-api-spec a718d07).
 
 ### Changed
 - A batch takes one limiter token per order or entry.
 - A 429 with `details.limit` `order_actions` holds only placements for its wait, not the whole client.
+- A placement waiting out an `order_actions` hold checks it again after the wait.
 
 ## [0.1.0-dev.12] (2026-10-09)
 

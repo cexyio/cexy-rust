@@ -5,8 +5,8 @@ use std::time::Duration;
 use crate::amount::check_amounts;
 use crate::batch::{
     BatchCancelResult, BatchOrderInput, BatchOrderOutcome, BatchPlaceResult, CancelEntryOutcome,
-    CancelOutcome, PlaceOutcome, cancel_from_result, cancel_result, check_cancel, check_place,
-    needs_lookup, place_from_result, place_result,
+    CancelOutcome, PlaceOutcome, cancel_from_result, cancel_matches, cancel_result, check_cancel,
+    check_place, needs_lookup, new_client_order_id, place_from_result, place_matches, place_result,
 };
 use crate::client::Client;
 use crate::error::{Error, ErrorCategory, Result};
@@ -674,17 +674,26 @@ impl<'a> Trading<'a> {
     /// batch is not atomic, and one refusal does not stop the rest.
     ///
     /// A `client_order_id` (a UUID) is generated for each order without one; your own ids must
-    /// be 1 to 64 characters of `A-Z a-z 0-9 _ - . :` and distinct. These checks fail locally,
-    /// before anything is sent.
+    /// be 1 to 64 characters of `A-Z a-z 0-9 _ - . :`, not `.` or `..`, and distinct. These
+    /// checks fail locally, before anything is sent. To reconcile after an error, or after
+    /// dropping the future (which returns nothing), set and save your own ids before the call,
+    /// for example with [`crate::new_client_order_id`].
     ///
     /// Retry safety: the body, ids included, is built once and every retry resends it
     /// unchanged. The server refuses a repeated id, so nothing is placed twice. After a lost
     /// answer, an order that the earlier attempt placed comes back as
     /// [`PlaceOutcome::Recovered`] with its `order_id` and `status` (`rejected` means refused for
-    /// funds; its id is spent). A refusal of the whole batch (400, 403, 404) is returned and never
-    /// retried; a batch larger than the key's whole budget (400 with a number in
-    /// `details["limit"]`) must be split by the caller. A 429 is waited out and the same body
-    /// resent. Results are in request order; the counts are computed from them.
+    /// funds; its id is spent). An item error that names an order (`MARKET_UNAVAILABLE` with
+    /// `details.order_id`) is `Recovered` too, and an item `INTERNAL` is looked up once. A 429 is
+    /// waited out and the same body resent; a 400, 403 or 404 is not retried; a batch larger
+    /// than the key's whole budget (400 with a number in `details["limit"]`) must be split by the
+    /// caller. Results are in request order; the counts are computed from them. An `Unknown`
+    /// item must be reconciled with [`Trading::order_by_client_id`] before it is placed again.
+    ///
+    /// Any failure after the request is built is [`Error::BatchPlace`], with every id sent and
+    /// `maybe_placed`: a refusal of the whole batch means nothing was placed only when no
+    /// earlier attempt was lost. A 200 that is not usable (no `data`, undecodable, or results
+    /// that do not match the orders sent) is such a failure with `maybe_placed` true.
     pub async fn place_orders(
         &self,
         symbol: &str,
@@ -707,7 +716,10 @@ impl<'a> Trading<'a> {
             )?;
             items.push(BatchOrderItem {
                 // Generated once, here: every attempt sends the same ids.
-                client_order_id: o.client_order_id.clone().unwrap_or_else(new_id),
+                client_order_id: o
+                    .client_order_id
+                    .clone()
+                    .unwrap_or_else(new_client_order_id),
                 side: o.side.clone(),
                 r#type: o.r#type.clone(),
                 price: o.price.clone(),
@@ -719,6 +731,7 @@ impl<'a> Trading<'a> {
             });
         }
         let n = items.len() as u32;
+        let sent: Vec<String> = items.iter().map(|i| i.client_order_id.clone()).collect();
         let body = BatchOrderRequest {
             symbol: symbol.to_string(),
             orders: items,
@@ -730,12 +743,35 @@ impl<'a> Trading<'a> {
         // No Idempotency-Key: the server does not honour one here (client_order_id does the job).
         call.no_idempotency_key = true;
         let mut attempts = Vec::new();
-        let raw = self
+        // From here on the request may have been sent: every failure carries the ids.
+        let failed = |source: Error, attempts: &[Attempt]| {
+            let maybe_placed = attempts.contains(&Attempt::Ambiguous)
+                || !matches!(source, Error::Api(_) | Error::Config(_));
+            Error::BatchPlace {
+                client_order_ids: sent.clone(),
+                maybe_placed,
+                source: Box::new(source),
+            }
+        };
+        let raw = match self
             .c
             .t
             .request_noting(call, &self.c.resolved(), &mut attempts)
-            .await?;
-        let data: BatchOrder = decode_data(OperationId::PlaceBatch, &raw)?;
+            .await
+        {
+            Ok(raw) => raw,
+            Err(e) => return Err(failed(e, &attempts)),
+        };
+        // A 200 that cannot be used is ambiguous: the orders may have been placed.
+        let data = match decode_data::<BatchOrder>(OperationId::PlaceBatch, &raw) {
+            Ok(d) if place_matches(&sent, &d.results) => d,
+            Ok(_) => {
+                let e =
+                    Error::Decode("place_batch: the results do not match the orders sent".into());
+                return Err(failed(e, &attempts));
+            }
+            Err(e) => return Err(failed(e, &attempts)),
+        };
         let after_ambiguous = attempts.contains(&Attempt::Ambiguous);
         let mut results = Vec::with_capacity(data.results.len());
         for r in data.results {
@@ -783,7 +819,9 @@ impl<'a> Trading<'a> {
         let n = entries.len() as u32;
         let mut call = Call::new(OperationId::CancelBatch)
             .cost(n)
-            .json(&CancelBatchRequest { orders: entries })?;
+            .json(&CancelBatchRequest {
+                orders: entries.clone(),
+            })?;
         // No Idempotency-Key: the server does not honour one on cancels.
         call.no_idempotency_key = true;
         let mut attempts = Vec::new();
@@ -793,6 +831,11 @@ impl<'a> Trading<'a> {
             .request_noting(call, &self.c.resolved(), &mut attempts)
             .await?;
         let data: CancelBatch = decode_data(OperationId::CancelBatch, &raw)?;
+        if !cancel_matches(&entries, &data.results) {
+            return Err(Error::Decode(
+                "cancel_batch: the results do not match the entries sent".into(),
+            ));
+        }
         let after_ambiguous = attempts.contains(&Attempt::Ambiguous);
         let mut results = Vec::with_capacity(data.results.len());
         for r in data.results {

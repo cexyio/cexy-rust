@@ -44,7 +44,7 @@ pub use amount::{Amount, BookLevel, levels};
 pub use auth::{ApiKeyAuthenticator, AuthRequest, Authenticator};
 pub use batch::{
     BatchCancelResult, BatchOrderInput, BatchOrderOutcome, BatchPlaceResult, CancelEntryOutcome,
-    CancelOutcome, MAX_BATCH_ORDERS, MAX_CANCEL_ENTRIES, PlaceOutcome,
+    CancelOutcome, MAX_BATCH_ORDERS, MAX_CANCEL_ENTRIES, PlaceOutcome, new_client_order_id,
 };
 pub use cancel_all::{CancelAllOptions, CancelAllStop, CancelAllSummary, CancelAllTarget};
 pub use client::{

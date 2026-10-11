@@ -145,10 +145,22 @@ c.trading().cancel_order_by_client_id("my-id-1").await?;
   funds and its id is spent: do not place it again under that id. `Unknown` means its state could
   not be read; it was not placed again (look it up with `order_by_client_id`). A cancel that a retry
   finds already closed is looked up and comes back as `Recovered` with its current status.
-- A whole batch is refused, with nothing placed, for a bad request (400), a market that does not
-  exist (404), an account that may not trade (403) or a spent budget (429, waited out and resent).
-  A batch larger than the key's whole budget is a 400 with a number in `details["limit"]`: send
-  fewer at a time. The SDK never splits a batch.
+- An item error that names an order (`MARKET_UNAVAILABLE` with `details.order_id`: the market
+  stopped while matching) means the order exists: it comes back `Recovered` with its status, on any
+  attempt. An item `INTERNAL` is looked up once by its id (`Recovered`, or `Unknown`). Reconcile
+  every `Unknown` item with `order_by_client_id` before placing it again.
+- A 400, 403 or 404 for the whole batch is returned at once, and a 429 is waited out and resent.
+  Such a refusal means the server placed nothing **in that attempt**; an earlier attempt whose
+  answer was lost may still have placed orders. A batch larger than the key's whole budget is a 400
+  with a number in `details["limit"]`: send fewer at a time. The SDK never splits a batch.
+- **When the call fails** after its request is built (retries run out, a refusal after a lost
+  answer, a timeout, or a 200 that is unreadable or does not match the orders sent), the error is
+  `Error::BatchPlace` with every `client_order_id` sent, in request order, and `maybe_placed`
+  (false only when every attempt was a definite refusal). Look those ids up, or send the same
+  orders again with the same ids, before placing anything anew.
+- **Supply and save your own `client_order_id`s before the call if you need to reconcile**
+  (`cexy::new_client_order_id()` makes one). It is the only protection when the future is
+  dropped, for example by `tokio::time::timeout`: a dropped call returns nothing.
 
 ### Market buys by total
 
