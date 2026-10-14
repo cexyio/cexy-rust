@@ -7,7 +7,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use super::helpers::*;
 use crate::{
-    CandlesParams, DEFAULT_MAX_BUSY_RETRIES, Error, OperationId, PAGING_CURSOR_REPEATED,
+    DEFAULT_MAX_BUSY_RETRIES, Error, FuturesCandlesParams, OperationId, PAGING_CURSOR_REPEATED,
     PAGING_STALLED,
 };
 
@@ -121,7 +121,7 @@ async fn every_futures_operation_is_covered() {
     assert!(f.market("BTC").await.unwrap().stale);
     let b = f.order_book("BTC", Some(5)).await.unwrap();
     assert_eq!(b.bids[0].size.as_str(), "1.5");
-    let mut cp = CandlesParams::new("1h");
+    let mut cp = FuturesCandlesParams::new("1h");
     cp.before = Some(1790000000000);
     assert_eq!(f.candles("BTC", &cp).await.unwrap().candles[0].trades, 7);
     assert_eq!(
@@ -310,7 +310,7 @@ async fn all_funding_pages_like_fills_and_stalls_the_same_way() {
         assert_eq!(e.code(), Some(PAGING_STALLED), "{case}");
         assert!(e.is_retryable(), "{case}");
         assert!(
-            matches!(e, Error::PagingStalled { operation: "funding", cursor, retries } if cursor == "x" && *retries == sleeps),
+            matches!(e, Error::PagingStalled { operation: "futures_funding", cursor, retries } if cursor == "x" && *retries == sleeps),
             "{case}: {e:?}"
         );
         assert!(e.to_string().contains("PAGING_STALLED"), "{e}");
@@ -348,7 +348,7 @@ async fn a_cursor_sent_twice_after_rows_fails_instead_of_looping() {
     assert_eq!(ids, ["f1", "f2", "f3"]);
     let e = items.last().unwrap().as_ref().unwrap_err();
     assert!(
-        matches!(e, Error::PagingCursorRepeated { operation: "fills", cursor } if cursor == "b"),
+        matches!(e, Error::PagingCursorRepeated { operation: "futures_fills", cursor } if cursor == "b"),
         "{e:?}"
     );
     assert_eq!(e.code(), Some(PAGING_CURSOR_REPEATED));

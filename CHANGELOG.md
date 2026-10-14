@@ -6,6 +6,15 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+- Spec sync with the server's futures release (2026-10-14): the 9 futures operation ids now
+  start with `futures_`. New names: `OperationId::Futures*` variants (`FuturesFills`, ...) and
+  `Futures*Params` types (`FuturesCandlesParams`, ...). Method names, wire requests and
+  responses are unchanged. The old names stay as deprecated aliases (associated constants on
+  `OperationId` and type aliases), so existing code compiles. `Error::PagingStalled` and
+  `Error::PagingCursorRepeated` now carry `operation: "futures_fills"` / `"futures_funding"`,
+  and `RetryInfo::operation` reports the new variants for futures calls.
+
 ## [0.1.0-dev.13] (2026-10-11)
 
 ### Added

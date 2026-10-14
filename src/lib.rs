@@ -26,6 +26,7 @@ mod batch;
 mod cancel_all;
 mod client;
 mod clock;
+mod compat_futures_ids;
 mod error;
 mod limiter;
 mod live_balances;
@@ -50,6 +51,10 @@ pub use cancel_all::{CancelAllOptions, CancelAllStop, CancelAllSummary, CancelAl
 pub use client::{
     AuthScheme, CallOptions, Client, ClientOptions, DEFAULT_BASE_URL, DEFAULT_RPM_ANONYMOUS,
     DEFAULT_RPM_WITH_KEY, OnRetry, is_local_host,
+};
+#[allow(deprecated)]
+pub use compat_futures_ids::{
+    CandlesParams, FillsParams, FundingParams, OrderbookParams, TradesParams,
 };
 pub use error::{
     ApiError, ConnectionError, Error, ErrorBody, ErrorCategory, MAX_SERVER_WAIT,

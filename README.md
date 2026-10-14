@@ -324,7 +324,7 @@ use futures_util::TryStreamExt;
 let f = c.futures();
 let markets = f.markets().await?; // every listed market, with `as_of` and `stale`
 let book = f.order_book("BTC", Some(10)).await?; // up to 20 levels a side
-let candles = f.candles("BTC", &cexy::CandlesParams::new("1h")).await?; // the latest 500
+let candles = f.candles("BTC", &cexy::FuturesCandlesParams::new("1h")).await?; // the latest 500
 let trades = f.trades("BTC", Some(50)).await?; // at most 100
 println!("{} markets, {} bids, {} candles, {} trades",
     markets.markets.len(), book.bids.len(), candles.candles.len(), trades.trades.len());
