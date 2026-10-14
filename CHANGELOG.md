@@ -6,6 +6,10 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-dev.14] (2026-10-14)
+
+- Built against cexy-api-spec `a4463b2` (futures operation ids start with `futures_`).
+
 ### Security
 - Require rustls 0.23.46 or later (RUSTSEC-2026-0346, -0347, -0348, -0349, fixed in 0.23.46).
   Users of earlier versions can run `cargo update -p rustls` to pick up the fix.
