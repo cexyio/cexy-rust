@@ -26,8 +26,6 @@ pub enum OperationId {
     CancelOrder,
     /// `cancel_order_by_client_id`
     CancelOrderByClientId,
-    /// `candles`
-    Candles,
     /// `deposit_address`
     DepositAddress,
     /// `exchange_config`
@@ -44,10 +42,24 @@ pub enum OperationId {
     ExportTrades,
     /// `export_withdrawals`
     ExportWithdrawals,
-    /// `fills`
-    Fills,
-    /// `funding`
-    Funding,
+    /// `futures_candles`
+    FuturesCandles,
+    /// `futures_fills`
+    FuturesFills,
+    /// `futures_funding`
+    FuturesFunding,
+    /// `futures_market`
+    FuturesMarket,
+    /// `futures_markets`
+    FuturesMarkets,
+    /// `futures_open_orders`
+    FuturesOpenOrders,
+    /// `futures_orderbook`
+    FuturesOrderbook,
+    /// `futures_positions`
+    FuturesPositions,
+    /// `futures_trades`
+    FuturesTrades,
     /// `get_account_id`
     GetAccountId,
     /// `get_asset`
@@ -102,30 +114,18 @@ pub enum OperationId {
     ListWithdrawalAddresses,
     /// `list_withdrawals`
     ListWithdrawals,
-    /// `market`
-    Market,
-    /// `markets`
-    Markets,
-    /// `open_orders`
-    OpenOrders,
     /// `order_history`
     OrderHistory,
-    /// `orderbook`
-    Orderbook,
     /// `place_batch`
     PlaceBatch,
     /// `place_order`
     PlaceOrder,
-    /// `positions`
-    Positions,
     /// `server_time`
     ServerTime,
     /// `sub_account_balances`
     SubAccountBalances,
     /// `trade_history`
     TradeHistory,
-    /// `trades`
-    Trades,
 }
 
 /// Method, path, authentication and required API-key scope of an operation.
@@ -149,7 +149,6 @@ impl OperationId {
         OperationId::CancelBatch,
         OperationId::CancelOrder,
         OperationId::CancelOrderByClientId,
-        OperationId::Candles,
         OperationId::DepositAddress,
         OperationId::ExchangeConfig,
         OperationId::ExitPool,
@@ -158,8 +157,15 @@ impl OperationId {
         OperationId::ExportOrders,
         OperationId::ExportTrades,
         OperationId::ExportWithdrawals,
-        OperationId::Fills,
-        OperationId::Funding,
+        OperationId::FuturesCandles,
+        OperationId::FuturesFills,
+        OperationId::FuturesFunding,
+        OperationId::FuturesMarket,
+        OperationId::FuturesMarkets,
+        OperationId::FuturesOpenOrders,
+        OperationId::FuturesOrderbook,
+        OperationId::FuturesPositions,
+        OperationId::FuturesTrades,
         OperationId::GetAccountId,
         OperationId::GetAsset,
         OperationId::GetBalance,
@@ -187,18 +193,12 @@ impl OperationId {
         OperationId::ListSubAccounts,
         OperationId::ListWithdrawalAddresses,
         OperationId::ListWithdrawals,
-        OperationId::Market,
-        OperationId::Markets,
-        OperationId::OpenOrders,
         OperationId::OrderHistory,
-        OperationId::Orderbook,
         OperationId::PlaceBatch,
         OperationId::PlaceOrder,
-        OperationId::Positions,
         OperationId::ServerTime,
         OperationId::SubAccountBalances,
         OperationId::TradeHistory,
-        OperationId::Trades,
     ];
 
     /// The API's operationId, such as `"place_order"`.
@@ -209,7 +209,6 @@ impl OperationId {
             OperationId::CancelBatch => "cancel_batch",
             OperationId::CancelOrder => "cancel_order",
             OperationId::CancelOrderByClientId => "cancel_order_by_client_id",
-            OperationId::Candles => "candles",
             OperationId::DepositAddress => "deposit_address",
             OperationId::ExchangeConfig => "exchange_config",
             OperationId::ExitPool => "exit_pool",
@@ -218,8 +217,15 @@ impl OperationId {
             OperationId::ExportOrders => "export_orders",
             OperationId::ExportTrades => "export_trades",
             OperationId::ExportWithdrawals => "export_withdrawals",
-            OperationId::Fills => "fills",
-            OperationId::Funding => "funding",
+            OperationId::FuturesCandles => "futures_candles",
+            OperationId::FuturesFills => "futures_fills",
+            OperationId::FuturesFunding => "futures_funding",
+            OperationId::FuturesMarket => "futures_market",
+            OperationId::FuturesMarkets => "futures_markets",
+            OperationId::FuturesOpenOrders => "futures_open_orders",
+            OperationId::FuturesOrderbook => "futures_orderbook",
+            OperationId::FuturesPositions => "futures_positions",
+            OperationId::FuturesTrades => "futures_trades",
             OperationId::GetAccountId => "get_account_id",
             OperationId::GetAsset => "get_asset",
             OperationId::GetBalance => "get_balance",
@@ -247,18 +253,12 @@ impl OperationId {
             OperationId::ListSubAccounts => "list_sub_accounts",
             OperationId::ListWithdrawalAddresses => "list_withdrawal_addresses",
             OperationId::ListWithdrawals => "list_withdrawals",
-            OperationId::Market => "market",
-            OperationId::Markets => "markets",
-            OperationId::OpenOrders => "open_orders",
             OperationId::OrderHistory => "order_history",
-            OperationId::Orderbook => "orderbook",
             OperationId::PlaceBatch => "place_batch",
             OperationId::PlaceOrder => "place_order",
-            OperationId::Positions => "positions",
             OperationId::ServerTime => "server_time",
             OperationId::SubAccountBalances => "sub_account_balances",
             OperationId::TradeHistory => "trade_history",
-            OperationId::Trades => "trades",
         }
     }
 
@@ -294,12 +294,6 @@ impl OperationId {
                 path: "/api/v1/trading/orders/by-client-id/{client_order_id}",
                 auth: "api_key",
                 scope: "trade",
-            },
-            OperationId::Candles => OperationInfo {
-                method: "GET",
-                path: "/api/v1/futures/markets/{coin}/candles",
-                auth: "none",
-                scope: "",
             },
             OperationId::DepositAddress => OperationInfo {
                 method: "GET",
@@ -349,17 +343,59 @@ impl OperationId {
                 auth: "api_key",
                 scope: "read",
             },
-            OperationId::Fills => OperationInfo {
+            OperationId::FuturesCandles => OperationInfo {
+                method: "GET",
+                path: "/api/v1/futures/markets/{coin}/candles",
+                auth: "none",
+                scope: "",
+            },
+            OperationId::FuturesFills => OperationInfo {
                 method: "GET",
                 path: "/api/v1/futures/fills",
                 auth: "api_key",
                 scope: "read",
             },
-            OperationId::Funding => OperationInfo {
+            OperationId::FuturesFunding => OperationInfo {
                 method: "GET",
                 path: "/api/v1/futures/funding",
                 auth: "api_key",
                 scope: "read",
+            },
+            OperationId::FuturesMarket => OperationInfo {
+                method: "GET",
+                path: "/api/v1/futures/markets/{coin}",
+                auth: "none",
+                scope: "",
+            },
+            OperationId::FuturesMarkets => OperationInfo {
+                method: "GET",
+                path: "/api/v1/futures/markets",
+                auth: "none",
+                scope: "",
+            },
+            OperationId::FuturesOpenOrders => OperationInfo {
+                method: "GET",
+                path: "/api/v1/futures/orders",
+                auth: "api_key",
+                scope: "read",
+            },
+            OperationId::FuturesOrderbook => OperationInfo {
+                method: "GET",
+                path: "/api/v1/futures/markets/{coin}/orderbook",
+                auth: "none",
+                scope: "",
+            },
+            OperationId::FuturesPositions => OperationInfo {
+                method: "GET",
+                path: "/api/v1/futures/positions",
+                auth: "api_key",
+                scope: "read",
+            },
+            OperationId::FuturesTrades => OperationInfo {
+                method: "GET",
+                path: "/api/v1/futures/markets/{coin}/trades",
+                auth: "none",
+                scope: "",
             },
             OperationId::GetAccountId => OperationInfo {
                 method: "GET",
@@ -523,35 +559,11 @@ impl OperationId {
                 auth: "api_key",
                 scope: "read",
             },
-            OperationId::Market => OperationInfo {
-                method: "GET",
-                path: "/api/v1/futures/markets/{coin}",
-                auth: "none",
-                scope: "",
-            },
-            OperationId::Markets => OperationInfo {
-                method: "GET",
-                path: "/api/v1/futures/markets",
-                auth: "none",
-                scope: "",
-            },
-            OperationId::OpenOrders => OperationInfo {
-                method: "GET",
-                path: "/api/v1/futures/orders",
-                auth: "api_key",
-                scope: "read",
-            },
             OperationId::OrderHistory => OperationInfo {
                 method: "GET",
                 path: "/api/v1/trading/orders/history",
                 auth: "api_key",
                 scope: "read",
-            },
-            OperationId::Orderbook => OperationInfo {
-                method: "GET",
-                path: "/api/v1/futures/markets/{coin}/orderbook",
-                auth: "none",
-                scope: "",
             },
             OperationId::PlaceBatch => OperationInfo {
                 method: "POST",
@@ -564,12 +576,6 @@ impl OperationId {
                 path: "/api/v1/trading/orders",
                 auth: "api_key",
                 scope: "trade",
-            },
-            OperationId::Positions => OperationInfo {
-                method: "GET",
-                path: "/api/v1/futures/positions",
-                auth: "api_key",
-                scope: "read",
             },
             OperationId::ServerTime => OperationInfo {
                 method: "GET",
@@ -589,46 +595,7 @@ impl OperationId {
                 auth: "api_key",
                 scope: "read",
             },
-            OperationId::Trades => OperationInfo {
-                method: "GET",
-                path: "/api/v1/futures/markets/{coin}/trades",
-                auth: "none",
-                scope: "",
-            },
         }
-    }
-}
-
-/// Query parameters of `candles`. `None` is not sent.
-#[derive(Debug, Clone, PartialEq, Default)]
-pub struct CandlesParams {
-    /// `1m`, `5m`, `15m`, `1h`, `4h` or `1d`.
-    ///
-    /// Required.
-    pub interval: String,
-    /// Unix milliseconds: the window of 500 candles holding this time. Absent: the latest 500.
-    pub before: Option<i64>,
-}
-
-impl CandlesParams {
-    /// Parameters with the required values; the optional ones are unset.
-    pub fn new(interval: impl Into<String>) -> Self {
-        Self {
-            interval: interval.into(),
-            before: None,
-        }
-    }
-
-    pub(crate) fn query(&self) -> Vec<(&'static str, String)> {
-        let mut q = Vec::new();
-        {
-            let v = &self.interval;
-            q.push(("interval", v.clone()));
-        }
-        if let Some(v) = &self.before {
-            q.push(("before", v.to_string()));
-        }
-        q
     }
 }
 
@@ -690,14 +657,47 @@ impl ExportParams {
     }
 }
 
-/// Query parameters of `fills`. `None` is not sent.
+/// Query parameters of `futures_candles`. `None` is not sent.
 #[derive(Debug, Clone, PartialEq, Default)]
-pub struct FillsParams {
+pub struct FuturesCandlesParams {
+    /// `1m`, `5m`, `15m`, `1h`, `4h` or `1d`.
+    ///
+    /// Required.
+    pub interval: String,
+    /// Unix milliseconds: the window of 500 candles holding this time. Absent: the latest 500.
+    pub before: Option<i64>,
+}
+
+impl FuturesCandlesParams {
+    /// Parameters with the required values; the optional ones are unset.
+    pub fn new(interval: impl Into<String>) -> Self {
+        Self {
+            interval: interval.into(),
+            before: None,
+        }
+    }
+
+    pub(crate) fn query(&self) -> Vec<(&'static str, String)> {
+        let mut q = Vec::new();
+        {
+            let v = &self.interval;
+            q.push(("interval", v.clone()));
+        }
+        if let Some(v) = &self.before {
+            q.push(("before", v.to_string()));
+        }
+        q
+    }
+}
+
+/// Query parameters of `futures_fills`. `None` is not sent.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct FuturesFillsParams {
     /// The `next_cursor` of the previous page, as given; absent for the newest. A unix time in milliseconds is also accepted: rows older than it.
     pub cursor: Option<String>,
 }
 
-impl FillsParams {
+impl FuturesFillsParams {
     pub(crate) fn query(&self) -> Vec<(&'static str, String)> {
         let mut q = Vec::new();
         if let Some(v) = &self.cursor {
@@ -707,18 +707,52 @@ impl FillsParams {
     }
 }
 
-/// Query parameters of `funding`. `None` is not sent.
+/// Query parameters of `futures_funding`. `None` is not sent.
 #[derive(Debug, Clone, PartialEq, Default)]
-pub struct FundingParams {
+pub struct FuturesFundingParams {
     /// The `next_cursor` of the previous page, as given; absent for the newest. A unix time in milliseconds is also accepted: rows older than it.
     pub cursor: Option<String>,
 }
 
-impl FundingParams {
+impl FuturesFundingParams {
     pub(crate) fn query(&self) -> Vec<(&'static str, String)> {
         let mut q = Vec::new();
         if let Some(v) = &self.cursor {
             q.push(("cursor", v.clone()));
+        }
+        q
+    }
+}
+
+/// Query parameters of `futures_orderbook`. `None` is not sent.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct FuturesOrderbookParams {
+    /// Levels per side, 1 to 20 (default 20).
+    pub depth: Option<i64>,
+}
+
+impl FuturesOrderbookParams {
+    pub(crate) fn query(&self) -> Vec<(&'static str, String)> {
+        let mut q = Vec::new();
+        if let Some(v) = &self.depth {
+            q.push(("depth", v.to_string()));
+        }
+        q
+    }
+}
+
+/// Query parameters of `futures_trades`. `None` is not sent.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct FuturesTradesParams {
+    /// 1 to 100 (default 50).
+    pub limit: Option<i64>,
+}
+
+impl FuturesTradesParams {
+    pub(crate) fn query(&self) -> Vec<(&'static str, String)> {
+        let mut q = Vec::new();
+        if let Some(v) = &self.limit {
+            q.push(("limit", v.to_string()));
         }
         q
     }
@@ -1000,23 +1034,6 @@ impl OrderHistoryParams {
     }
 }
 
-/// Query parameters of `orderbook`. `None` is not sent.
-#[derive(Debug, Clone, PartialEq, Default)]
-pub struct OrderbookParams {
-    /// Levels per side, 1 to 20 (default 20).
-    pub depth: Option<i64>,
-}
-
-impl OrderbookParams {
-    pub(crate) fn query(&self) -> Vec<(&'static str, String)> {
-        let mut q = Vec::new();
-        if let Some(v) = &self.depth {
-            q.push(("depth", v.to_string()));
-        }
-        q
-    }
-}
-
 /// Query parameters of `trade_history`. `None` is not sent.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct TradeHistoryParams {
@@ -1044,23 +1061,6 @@ impl TradeHistoryParams {
         }
         if let Some(v) = &self.direction {
             q.push(("direction", v.as_str().to_string()));
-        }
-        q
-    }
-}
-
-/// Query parameters of `trades`. `None` is not sent.
-#[derive(Debug, Clone, PartialEq, Default)]
-pub struct TradesParams {
-    /// 1 to 100 (default 50).
-    pub limit: Option<i64>,
-}
-
-impl TradesParams {
-    pub(crate) fn query(&self) -> Vec<(&'static str, String)> {
-        let mut q = Vec::new();
-        if let Some(v) = &self.limit {
-            q.push(("limit", v.to_string()));
         }
         q
     }

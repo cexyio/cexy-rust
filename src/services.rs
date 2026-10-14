@@ -1037,25 +1037,25 @@ impl<'a> Futures<'a> {
 
     /// Every listed futures market and its current figures.
     pub async fn markets(&self) -> Result<FuturesMarkets> {
-        self.c.get(Call::new(OperationId::Markets)).await
+        self.c.get(Call::new(OperationId::FuturesMarkets)).await
     }
 
     /// One futures market, by the provider's coin name, such as `"BTC"`.
     pub async fn market(&self, coin: &str) -> Result<FuturesMarket> {
         self.c
-            .get(Call::new(OperationId::Market).path("coin", coin))
+            .get(Call::new(OperationId::FuturesMarket).path("coin", coin))
             .await
     }
 
     /// A market's book, `depth` levels a side (1 to 20; `None`: the server's default, 20).
     /// `stale` is the live feed's health, not the book's age.
     pub async fn order_book(&self, coin: &str, depth: Option<u32>) -> Result<FuturesBook> {
-        let p = OrderbookParams {
+        let p = FuturesOrderbookParams {
             depth: depth.map(i64::from),
         };
         self.c
             .get(
-                Call::new(OperationId::Orderbook)
+                Call::new(OperationId::FuturesOrderbook)
                     .path("coin", coin)
                     .query(p.query()),
             )
@@ -1063,10 +1063,14 @@ impl<'a> Futures<'a> {
     }
 
     /// 500 candles: the latest, or the window holding `params.before`.
-    pub async fn candles(&self, coin: &str, params: &CandlesParams) -> Result<FuturesCandles> {
+    pub async fn candles(
+        &self,
+        coin: &str,
+        params: &FuturesCandlesParams,
+    ) -> Result<FuturesCandles> {
         self.c
             .get(
-                Call::new(OperationId::Candles)
+                Call::new(OperationId::FuturesCandles)
                     .path("coin", coin)
                     .query(params.query()),
             )
@@ -1076,12 +1080,12 @@ impl<'a> Futures<'a> {
     /// Recent public trades, newest first: `limit` of them (1 to 100; `None`: the server's
     /// default, 50).
     pub async fn trades(&self, coin: &str, limit: Option<u32>) -> Result<FuturesTrades> {
-        let p = TradesParams {
+        let p = FuturesTradesParams {
             limit: limit.map(i64::from),
         };
         self.c
             .get(
-                Call::new(OperationId::Trades)
+                Call::new(OperationId::FuturesTrades)
                     .path("coin", coin)
                     .query(p.query()),
             )
@@ -1090,12 +1094,12 @@ impl<'a> Futures<'a> {
 
     /// The account's margin summary and open positions.
     pub async fn positions(&self) -> Result<FuturesPositions> {
-        self.c.get(Call::new(OperationId::Positions)).await
+        self.c.get(Call::new(OperationId::FuturesPositions)).await
     }
 
     /// The account's open futures orders.
     pub async fn open_orders(&self) -> Result<FuturesOpenOrders> {
-        self.c.get(Call::new(OperationId::OpenOrders)).await
+        self.c.get(Call::new(OperationId::FuturesOpenOrders)).await
     }
 
     /// One page of the account's fills, newest first (30 days back). `cursor` is the previous
@@ -1103,21 +1107,21 @@ impl<'a> Futures<'a> {
     /// A page can be short, even empty, and still have a `next_cursor`: keep paging until it is
     /// `None`, or use [`Futures::all_fills`].
     pub async fn fills(&self, cursor: Option<&str>) -> Result<FuturesFills> {
-        let p = FillsParams {
+        let p = FuturesFillsParams {
             cursor: cursor.map(str::to_string),
         };
         self.c
-            .get(Call::new(OperationId::Fills).query(p.query()))
+            .get(Call::new(OperationId::FuturesFills).query(p.query()))
             .await
     }
 
     /// One page of the account's funding payments, newest first; paged like [`Futures::fills`].
     pub async fn funding(&self, cursor: Option<&str>) -> Result<FuturesFunding> {
-        let p = FundingParams {
+        let p = FuturesFundingParams {
             cursor: cursor.map(str::to_string),
         };
         self.c
-            .get(Call::new(OperationId::Funding).query(p.query()))
+            .get(Call::new(OperationId::FuturesFunding).query(p.query()))
             .await
     }
 
@@ -1131,27 +1135,35 @@ impl<'a> Futures<'a> {
     /// account the stream is empty. `max_items` stops the stream after that many items in total.
     pub fn all_fills(&self, max_items: Option<usize>) -> ItemStream<'a, FuturesFill> {
         let this = *self;
-        self.all(OperationId::Fills, max_items, move |cursor| async move {
-            let p = this.fills(cursor.as_deref()).await?;
-            Ok(HistoryPage {
-                rows: p.fills,
-                has_account: p.has_account,
-                next_cursor: p.next_cursor,
-            })
-        })
+        self.all(
+            OperationId::FuturesFills,
+            max_items,
+            move |cursor| async move {
+                let p = this.fills(cursor.as_deref()).await?;
+                Ok(HistoryPage {
+                    rows: p.fills,
+                    has_account: p.has_account,
+                    next_cursor: p.next_cursor,
+                })
+            },
+        )
     }
 
     /// Every funding payment (30 days back), newest first; see [`Futures::all_fills`].
     pub fn all_funding(&self, max_items: Option<usize>) -> ItemStream<'a, Funding> {
         let this = *self;
-        self.all(OperationId::Funding, max_items, move |cursor| async move {
-            let p = this.funding(cursor.as_deref()).await?;
-            Ok(HistoryPage {
-                rows: p.funding,
-                has_account: p.has_account,
-                next_cursor: p.next_cursor,
-            })
-        })
+        self.all(
+            OperationId::FuturesFunding,
+            max_items,
+            move |cursor| async move {
+                let p = this.funding(cursor.as_deref()).await?;
+                Ok(HistoryPage {
+                    rows: p.funding,
+                    has_account: p.has_account,
+                    next_cursor: p.next_cursor,
+                })
+            },
+        )
     }
 
     fn all<T, F, Fut>(
