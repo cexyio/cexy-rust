@@ -6,6 +6,10 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Security
+- Require rustls 0.23.46 or later (RUSTSEC-2026-0346, -0347, -0348, -0349, fixed in 0.23.46).
+  Users of earlier versions can run `cargo update -p rustls` to pick up the fix.
+
 ### Changed
 - Spec sync with the server's futures release (2026-10-14): the 9 futures operation ids now
   start with `futures_`. New names: `OperationId::Futures*` variants (`FuturesFills`, ...) and
