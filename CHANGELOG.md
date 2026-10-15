@@ -6,6 +6,27 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+- `Futures::all_fills` / `all_funding`: a 503 with `details.reason` `futures_data_unavailable` is a
+  busy answer, on any request including the first. It shares the `max_busy_retries` count with the
+  empty same-cursor page (an advancing page resets it) and is not retried by the request retries, so
+  a client with `max_retries` 0 rides it out and a cursor is asked at most 1 + `max_busy_retries`
+  times. The wait is the Retry-After header, else `details.retry_after_seconds`, used as given (no
+  jitter), else the normal backoff. A long provider outage now ends iteration with `PAGING_STALLED`
+  (retryable), not `SERVICE_UNAVAILABLE`; the 503 is the error's `source()` (an `ApiError`, so
+  `details["reason"]` stays reachable). Other 503s, 5xx and 429 keep the request retries.
+  `Error::PagingStalled` has a new field `source`: patterns need `..`.
+
+### Added
+- `WsError::channel`, `WsError::details` and `WsError::retry_after` (from the server error frame's
+  `channel` and `details`, `details.retry_after_seconds`). Empty for local errors and when the frame
+  has none (or malformed ones). The SDK does not retry on `retry_after`.
+- `ApiError` implements `std::error::Error`.
+
+### Breaking
+- `WsError` is `#[non_exhaustive]`: patterns need `..` (it was never constructible outside the crate
+  by intent; struct literals no longer compile).
+
 ## [0.1.0-dev.14] (2026-10-14)
 
 - Built against cexy-api-spec `a4463b2` (futures operation ids start with `futures_`).

@@ -93,7 +93,8 @@ pub enum Error {
     Decode(String),
 
     /// An iterate-all helper ([`crate::Futures::all_fills`], [`crate::Futures::all_funding`])
-    /// kept getting an empty page whose `next_cursor` was the cursor it had sent: the server's
+    /// kept getting a busy answer for the same cursor, an empty page whose `next_cursor` was the
+    /// cursor it had sent or a 503 with `details.reason` `futures_data_unavailable`: the server's
     /// data source is busy. It waited and asked again `retries` times (see
     /// [`crate::Futures::with_max_busy_retries`]), then gave up. Code [`PAGING_STALLED`], a local
     /// error (never sent by the server). Retryable: page again later from `cursor`. The rows
@@ -108,6 +109,11 @@ pub enum Error {
         cursor: String,
         /// How many times the same cursor was asked again.
         retries: u32,
+        /// The last busy answer, when it was a 503 `futures_data_unavailable` (an [`ApiError`]),
+        /// so its `details["reason"]` stays reachable (`std::error::Error::source`, then
+        /// `downcast_ref::<ApiError>()`); `None` for an empty same-cursor page.
+        #[source]
+        source: Option<Box<dyn std::error::Error + Send + Sync>>,
     },
 
     /// An iterate-all helper got a page WITH rows whose `next_cursor` was the cursor it had just
@@ -257,6 +263,8 @@ pub struct ApiError {
     pub retryable: bool,
     /// How long the server asked to wait (Retry-After or `details.retry_after_seconds`).
     pub retry_after: Option<Duration>,
+    /// The Retry-After header alone (`retry_after` also takes `details.retry_after_seconds`).
+    header_wait: Option<Duration>,
     category: Option<ErrorCategory>,
 }
 
@@ -272,6 +280,20 @@ impl ApiError {
             return false;
         }
         self.retryable || concurrent
+    }
+
+    /// A 503 whose `details.reason` is `futures_data_unavailable`: the futures provider is busy.
+    pub(crate) fn is_futures_busy(&self) -> bool {
+        self.status == 503
+            && self.details.get("reason").and_then(Value::as_str)
+                == Some("futures_data_unavailable")
+    }
+
+    /// The wait the server hinted, for the futures history helpers: the Retry-After header, else
+    /// `details.retry_after_seconds`. A missing, unparseable or non-positive hint is skipped.
+    pub(crate) fn busy_hint(&self) -> Option<Duration> {
+        self.header_wait
+            .or_else(|| details_wait(&self.details).and_then(server_secs))
     }
 
     /// The category, or `None` for a code this SDK does not know.
@@ -298,6 +320,8 @@ impl fmt::Display for ApiError {
         Ok(())
     }
 }
+
+impl std::error::Error for ApiError {}
 
 impl fmt::Debug for ApiError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -377,6 +401,7 @@ impl fmt::Display for ConnectionError {
 
 /// A WebSocket protocol error, a server error frame (`from_server`), or a local guard.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct WsError {
     /// Such as `NOT_CONNECTED`, `TIMEOUT`, `LOCAL_RATE_LIMIT`, or the server's code.
     pub code: String,
@@ -384,6 +409,14 @@ pub struct WsError {
     pub message: String,
     /// True when it came from a server error frame.
     pub from_server: bool,
+    /// The channel a server error frame names (such as a refused subscribe); `None` when the
+    /// frame has none and for local errors.
+    pub channel: Option<String>,
+    /// The frame's `details` object; empty when absent, not an object, and for local errors.
+    pub details: BTreeMap<String, Value>,
+    /// The wait the frame asked for (`details.retry_after_seconds`); `None` when absent, not a
+    /// positive number, and for local errors. The SDK does not retry on it: it is for the caller.
+    pub retry_after: Option<Duration>,
 }
 
 impl WsError {
@@ -392,6 +425,36 @@ impl WsError {
             code: code.to_string(),
             message: message.into(),
             from_server: false,
+            channel: None,
+            details: BTreeMap::new(),
+            retry_after: None,
+        }
+    }
+
+    /// A server error frame: `channel` and `details` are optional and never an error to decode.
+    pub(crate) fn from_frame(
+        code: &str,
+        message: &str,
+        frame: &serde_json::Map<String, Value>,
+    ) -> WsError {
+        let details: BTreeMap<String, Value> = frame
+            .get("details")
+            .and_then(Value::as_object)
+            .map(|o| o.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+            .unwrap_or_default();
+        WsError {
+            code: code.to_string(),
+            message: message.to_string(),
+            from_server: true,
+            channel: frame
+                .get("channel")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            retry_after: details
+                .get("retry_after_seconds")
+                .and_then(Value::as_f64)
+                .and_then(server_secs),
+            details,
         }
     }
 }
@@ -427,6 +490,7 @@ pub(crate) fn error_from_response(
         request_id: header_rid,
         retryable: default_retryable(status),
         retry_after: None,
+        header_wait: None,
         category: None,
     };
     let env: Option<Value> = serde_json::from_slice(body).ok();
@@ -469,6 +533,7 @@ pub(crate) fn error_from_response(
         }
     }
     e.message = redact(&e.message);
+    e.header_wait = header_wait(headers);
     e.retry_after = retry_after(headers, &e.details);
     e.category = if status == 429 || e.code == ErrorCode::RateLimited {
         Some(ErrorCategory::RateLimited)
@@ -516,6 +581,7 @@ pub(crate) fn redirect_error(
         request_id: header(headers, "x-request-id"),
         retryable: false,
         retry_after: None,
+        header_wait: None,
         category: Some(ErrorCategory::UnexpectedRedirect),
     }
 }
@@ -560,28 +626,33 @@ pub(crate) fn server_secs(secs: f64) -> Option<Duration> {
 /// Reads Retry-After (seconds or an HTTP date) and `details.retry_after_seconds`; the larger wins.
 /// Both are untrusted: garbage is ignored and nothing here can panic.
 fn retry_after(headers: &HeaderMap, details: &BTreeMap<String, Value>) -> Option<Duration> {
-    let mut best: Option<Duration> = None;
-    if let Some(v) = header(headers, "retry-after") {
-        if let Ok(secs) = v.parse::<f64>() {
-            best = server_secs(secs);
-        } else if let Ok(at) = chrono::DateTime::parse_from_rfc2822(&v) {
-            let d = at.with_timezone(&chrono::Utc) - chrono::Utc::now();
-            if let Ok(d) = d.to_std()
-                && !d.is_zero()
-            {
-                best = Some(d);
-            }
-        }
-    }
-    let secs = match details.get("retry_after_seconds") {
-        Some(Value::Number(n)) => n.as_f64(),
-        Some(Value::String(s)) => s.parse::<f64>().ok(),
-        _ => None,
-    };
-    if let Some(d) = secs.and_then(server_secs)
+    let mut best = header_wait(headers);
+    if let Some(d) = details_wait(details).and_then(server_secs)
         && best.is_none_or(|b| d > b)
     {
         best = Some(d);
     }
     best
+}
+
+/// The Retry-After header as a wait (seconds or an HTTP date); garbage gives `None`.
+fn header_wait(headers: &HeaderMap) -> Option<Duration> {
+    let v = header(headers, "retry-after")?;
+    if let Ok(secs) = v.parse::<f64>() {
+        return server_secs(secs);
+    }
+    let at = chrono::DateTime::parse_from_rfc2822(&v).ok()?;
+    let d = (at.with_timezone(&chrono::Utc) - chrono::Utc::now())
+        .to_std()
+        .ok()?;
+    (!d.is_zero()).then_some(d)
+}
+
+/// `details.retry_after_seconds` as a number of seconds, if it is one.
+fn details_wait(details: &BTreeMap<String, Value>) -> Option<f64> {
+    match details.get("retry_after_seconds") {
+        Some(Value::Number(n)) => n.as_f64(),
+        Some(Value::String(s)) => s.parse::<f64>().ok(),
+        _ => None,
+    }
 }

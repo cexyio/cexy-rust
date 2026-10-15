@@ -7,8 +7,8 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use super::helpers::*;
 use crate::{
-    DEFAULT_MAX_BUSY_RETRIES, Error, FuturesCandlesParams, OperationId, PAGING_CURSOR_REPEATED,
-    PAGING_STALLED,
+    ApiError, DEFAULT_MAX_BUSY_RETRIES, Error, FuturesCandlesParams, OperationId,
+    PAGING_CURSOR_REPEATED, PAGING_STALLED,
 };
 
 const AS_OF: &str = "2026-10-02T08:00:00Z";
@@ -310,7 +310,7 @@ async fn all_funding_pages_like_fills_and_stalls_the_same_way() {
         assert_eq!(e.code(), Some(PAGING_STALLED), "{case}");
         assert!(e.is_retryable(), "{case}");
         assert!(
-            matches!(e, Error::PagingStalled { operation: "futures_funding", cursor, retries } if cursor == "x" && *retries == sleeps),
+            matches!(e, Error::PagingStalled { operation: "futures_funding", cursor, retries, .. } if cursor == "x" && *retries == sleeps),
             "{case}: {e:?}"
         );
         assert!(e.to_string().contains("PAGING_STALLED"), "{e}");
@@ -417,16 +417,19 @@ async fn history_paging_conformance() {
         .map(|c| (c, "fills"))
         .chain(funding.iter().map(|c| (c, "funding")));
     for (case, op) in all {
-        // The busy retries do not depend on the client's request retries: run every case on the
-        // default client, and the ones without an HTTP error (which needs the request retries)
-        // on a client with retries disabled too.
+        // The busy retries do not depend on the client's request retries: a case that names
+        // `client.max_retries` runs with it; any other runs on the default client, and the ones
+        // without an HTTP error (which needs the request retries) on a client with retries
+        // disabled too.
         let has_http_error = case["pages"]
             .as_array()
             .unwrap()
             .iter()
             .any(|p| p.get("http_status").is_some());
         let mut runs = vec![None];
-        if !has_http_error {
+        if let Some(n) = case["client"]["max_retries"].as_u64() {
+            runs = vec![Some(n as u32)];
+        } else if !has_http_error {
             runs.push(Some(0));
         }
         for max_retries in runs {
@@ -449,15 +452,19 @@ async fn run_history_case(case: &Value, op: &str, max_retries: Option<u32>) {
         .mount(&s)
         .await;
     let (c, clock) = client_with(&s, true, |o| o.max_retries = max_retries);
+    let futures = match case["max_busy_retries"].as_u64() {
+        Some(n) => c.futures().with_max_busy_retries(n as u32),
+        None => c.futures(),
+    };
     // Fills are identified by id, funding rows (no id) by time.
     let items: Vec<crate::Result<Value>> = if op == "fills" {
-        c.futures()
+        futures
             .all_fills(None)
             .map(|r| r.map(|f| json!(f.id)))
             .collect()
             .await
     } else {
-        c.futures()
+        futures
             .all_funding(None)
             .map(|r| r.map(|f| json!(f.time)))
             .collect()
@@ -483,7 +490,12 @@ async fn run_history_case(case: &Value, op: &str, max_retries: Option<u32>) {
         );
         assert_eq!(e.code(), Some(code), "{id}");
         assert!(
-            [PAGING_STALLED, PAGING_CURSOR_REPEATED].contains(&code),
+            [
+                PAGING_STALLED,
+                PAGING_CURSOR_REPEATED,
+                "SERVICE_UNAVAILABLE"
+            ]
+            .contains(&code),
             "{id}"
         );
         assert_eq!(
@@ -491,6 +503,17 @@ async fn run_history_case(case: &Value, op: &str, max_retries: Option<u32>) {
             expect["error_retryable"].as_bool().unwrap(),
             "{id}"
         );
+        if let Some(reason) = expect["error_cause_reason"].as_str() {
+            let cause = std::error::Error::source(e).unwrap_or_else(|| panic!("{id}: no cause"));
+            let cause = cause
+                .downcast_ref::<ApiError>()
+                .expect("cause is an ApiError");
+            assert_eq!(
+                cause.details["reason"],
+                json!(reason),
+                "{id}: reason through the cause"
+            );
+        }
     } else {
         assert!(err.is_none(), "{id}: {err:?}");
         let want = if op == "fills" {
@@ -513,13 +536,18 @@ async fn run_history_case(case: &Value, op: &str, max_retries: Option<u32>) {
         expect["sleeps"].as_u64().unwrap(),
         "{id}: sleeps"
     );
-    if let Some(min) = expect["min_sleep_seconds"].as_u64() {
-        assert!(
-            sleeps
-                .iter()
-                .all(|d| *d >= std::time::Duration::from_secs(min)),
-            "{id}: {sleeps:?}"
-        );
+    // The fake clock's backoff (random 0.5) is 250 ms, 500 ms, 1 s for the first retries; any
+    // other wait was a server hint, used exactly. So no fixture hint may be 0.25, 0.5 or 1 s.
+    let backoff = [250, 500, 1000].map(std::time::Duration::from_millis);
+    let (soft, hinted): (Vec<std::time::Duration>, Vec<std::time::Duration>) =
+        sleeps.iter().copied().partition(|d| backoff.contains(d));
+    if let Some(want) = expect["sleep_seconds"].as_array() {
+        let got: Vec<_> = hinted.iter().map(|d| json!(d.as_secs_f64())).collect();
+        let want: Vec<_> = want.iter().map(|v| json!(v.as_f64().unwrap())).collect();
+        assert_eq!(got, want, "{id}: hinted waits {sleeps:?}");
+    }
+    if let Some(n) = expect["backoff_sleeps"].as_u64() {
+        assert_eq!(soft.len() as u64, n, "{id}: backoff waits {sleeps:?}");
     }
     for (i, (req, page)) in reqs.iter().zip(pages).enumerate() {
         let sent: Option<String> = req

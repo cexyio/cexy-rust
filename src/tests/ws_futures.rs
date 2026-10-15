@@ -860,3 +860,71 @@ async fn subscribe_refusals_conformance() {
         ws.close().await;
     }
 }
+
+/// A server `error` frame keeps its optional `channel` and `details`, and `retry_after` from
+/// `details.retry_after_seconds`; anything malformed there is just absent, never a decode error.
+#[tokio::test]
+async fn error_frame_channel_details_and_retry_after() {
+    let mut srv = Server::start_with(welcome()).await;
+    let (ws, _rx, mut conn) = connected(&mut srv).await;
+    let frame = |extra: Value| {
+        let mut f = json!({"type": "error", "code": "RATE_LIMITED", "message": "m"});
+        f.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        f
+    };
+    let cases = [
+        // (extra keys of the frame, channel, details, retry_after seconds)
+        (
+            json!({"channel": "futures.orderbook:NOPE", "details": {"retry_after_seconds": 60}}),
+            Some("futures.orderbook:NOPE"),
+            json!({"retry_after_seconds": 60}),
+            Some(60),
+        ),
+        (json!({}), None, json!({}), None),
+        (json!({"details": null}), None, json!({}), None),
+        (json!({"details": "x"}), None, json!({}), None),
+        (json!({"details": [1]}), None, json!({}), None),
+        (
+            json!({"details": {"retry_after_seconds": "60"}}),
+            None,
+            json!({"retry_after_seconds": "60"}),
+            None,
+        ),
+        (
+            json!({"details": {"retry_after_seconds": -1}}),
+            None,
+            json!({"retry_after_seconds": -1}),
+            None,
+        ),
+        (
+            json!({"extra_key": {"a": 1}, "channel": "c"}),
+            Some("c"),
+            json!({}),
+            None,
+        ),
+    ];
+    for (i, (extra, channel, details, retry_after)) in cases.into_iter().enumerate() {
+        let t = subscribe_task(&ws, &["futures.mids"]);
+        let req = conn.recv().await;
+        let mut f = frame(extra);
+        f["id"] = req["id"].clone();
+        conn.send(f);
+        let e = t.await.unwrap().unwrap_err();
+        let Error::WebSocket(w) = &e else {
+            panic!("case {i}: {e:?}")
+        };
+        assert!(w.from_server, "case {i}");
+        assert_eq!(w.channel.as_deref(), channel, "case {i}: channel");
+        assert_eq!(json!(w.details), details, "case {i}: details");
+        assert_eq!(
+            w.retry_after,
+            retry_after.map(Duration::from_secs),
+            "case {i}: retry_after"
+        );
+    }
+    let local = crate::WsError::local("NOT_CONNECTED", "x");
+    assert!(local.channel.is_none() && local.details.is_empty() && local.retry_after.is_none());
+    ws.close().await;
+}

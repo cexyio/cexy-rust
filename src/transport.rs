@@ -10,7 +10,7 @@ use url::Url;
 use crate::auth::{AuthRequest, Authenticator};
 use crate::clock::Clock;
 use crate::error::{
-    ConnectionError, Error, ErrorCategory, MAX_SERVER_WAIT, Result, error_from_response,
+    ApiError, ConnectionError, Error, ErrorCategory, MAX_SERVER_WAIT, Result, error_from_response,
     redirect_error,
 };
 use crate::limiter::{PlacementHold, RateLimiter};
@@ -62,6 +62,9 @@ pub(crate) struct Call {
     /// Placements in this call (0 for anything else): they wait out an `order_actions` hold and
     /// the optional order-actions budget.
     pub(crate) order_actions: u32,
+    /// A 503 `futures_data_unavailable` is not retried by the request retries (the futures
+    /// history helpers handle it as a busy answer with their own budget).
+    pub(crate) busy_not_retried: bool,
 }
 
 /// How a failed attempt ended, as the batch calls need to know it.
@@ -98,7 +101,12 @@ impl Call {
             no_idempotency_key: false,
             cost: 1,
             order_actions: 0,
+            busy_not_retried: false,
         }
+    }
+    pub(crate) fn busy_not_retried(mut self) -> Call {
+        self.busy_not_retried = true;
+        self
     }
     pub(crate) fn cost(mut self, tokens: u32) -> Call {
         self.cost = tokens;
@@ -188,7 +196,10 @@ impl Transport {
                 Ok(raw) => return Ok(raw),
                 Err(e) => {
                     attempts.push(Attempt::of(&e));
-                    if attempt >= max_retries || !e.is_retryable() {
+                    if attempt >= max_retries
+                        || !e.is_retryable()
+                        || (c.busy_not_retried && e.api().is_some_and(ApiError::is_futures_busy))
+                    {
                         return Err(e);
                     }
                     self.backoff(c.op, attempt, &e, c.idempotency_key.as_deref())
@@ -208,6 +219,18 @@ impl Transport {
         idem: Option<&str>,
     ) {
         let d = self.retry_delay(attempt, cause);
+        self.wait(op, attempt, cause, idem, d).await;
+    }
+
+    /// Waits exactly `d` before retry number `attempt + 1`, telling the retry hook.
+    pub(crate) async fn wait(
+        &self,
+        op: OperationId,
+        attempt: u32,
+        cause: &Error,
+        idem: Option<&str>,
+        d: Duration,
+    ) {
         if let Some(hook) = &self.on_retry {
             let info = op.info();
             hook(&RetryInfo {
