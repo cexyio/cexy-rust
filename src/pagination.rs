@@ -7,7 +7,7 @@ use std::pin::Pin;
 use futures_util::Stream;
 use serde::Deserialize;
 
-use crate::error::{ApiError, Error, Result};
+use crate::error::{ApiError, Error, MAX_SERVER_WAIT, Result};
 
 /// One page of a cursor-paginated listing.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -171,8 +171,9 @@ where
             let page = match (s.fetch)(s.cursor.clone()).await {
                 Ok(page) => page,
                 // A 503 `futures_data_unavailable` is a busy answer too (any request, the first
-                // included), unless its wait is too long to take (then it is not retryable).
-                Err(e) if e.is_retryable() && e.api().is_some_and(ApiError::is_futures_busy) => {
+                // included). An exhausted budget wins; otherwise a hint over MAX_SERVER_WAIT
+                // (Retry-After first, then details.retry_after_seconds) fails at once with the 503.
+                Err(e) if e.api().is_some_and(ApiError::is_futures_busy) => {
                     if s.retries >= s.max_busy_retries {
                         s.done = true;
                         let stalled = Error::PagingStalled {
@@ -182,6 +183,13 @@ where
                             source: e.api().cloned().map(|a| Box::new(a) as _),
                         };
                         return Some((Err(stalled), s));
+                    }
+                    if e.api()
+                        .and_then(ApiError::busy_hint)
+                        .is_some_and(|d| d > MAX_SERVER_WAIT)
+                    {
+                        s.done = true;
+                        return Some((Err(e), s));
                     }
                     (s.wait)(s.retries, e).await;
                     s.retries += 1;

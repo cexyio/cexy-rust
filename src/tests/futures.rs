@@ -537,7 +537,7 @@ async fn run_history_case(case: &Value, op: &str, max_retries: Option<u32>) {
         "{id}: sleeps"
     );
     // The fake clock's backoff (random 0.5) is 250 ms, 500 ms, 1 s for the first retries; any
-    // other wait was a server hint, used exactly.
+    // other wait was a server hint, used exactly. So no fixture hint may be 0.25, 0.5 or 1 s.
     let backoff = [250, 500, 1000].map(std::time::Duration::from_millis);
     let (soft, hinted): (Vec<std::time::Duration>, Vec<std::time::Duration>) =
         sleeps.iter().copied().partition(|d| backoff.contains(d));
