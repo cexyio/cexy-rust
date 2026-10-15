@@ -1683,11 +1683,7 @@ impl Inner {
                     .and_then(Value::as_str)
                     .filter(|s| !s.is_empty())
                     .unwrap_or(code);
-                let err = WsError {
-                    code: code.to_string(),
-                    message: message.to_string(),
-                    from_server: true,
-                };
+                let err = WsError::from_frame(code, message, &frame);
                 // An error reply to auth_key carries the next challenge too.
                 this.store_challenge(&frame);
                 if let Some(id) = &id {

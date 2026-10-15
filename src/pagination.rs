@@ -7,7 +7,7 @@ use std::pin::Pin;
 use futures_util::Stream;
 use serde::Deserialize;
 
-use crate::error::{Error, Result};
+use crate::error::{ApiError, Error, Result};
 
 /// One page of a cursor-paginated listing.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -122,6 +122,10 @@ struct HistoryState<F, W, T> {
 ///   (the transport's backoff, on the client's clock) and ask for the same cursor again, at most
 ///   `max_busy_retries` times in a row (its own setting, not the client's request retries), then
 ///   yield [`Error::PagingStalled`] (retryable) and stop;
+/// - a 503 whose `details.reason` is `futures_data_unavailable` is a busy answer too, on any
+///   request including the first, with the same count (`fetch` must not retry it itself);
+///   `wait` gets that error to read its hint; when the budget runs out the 503 is the
+///   `source` of the [`Error::PagingStalled`]; any other error ends the stream;
 /// - a page WITH rows whose `next_cursor` is the cursor just sent would repeat itself: its rows
 ///   are yielded, then [`Error::PagingCursorRepeated`] (not retryable), never a loop;
 /// - `has_account` false ends the stream with no rows.
@@ -166,6 +170,23 @@ where
             }
             let page = match (s.fetch)(s.cursor.clone()).await {
                 Ok(page) => page,
+                // A 503 `futures_data_unavailable` is a busy answer too (any request, the first
+                // included), unless its wait is too long to take (then it is not retryable).
+                Err(e) if e.is_retryable() && e.api().is_some_and(ApiError::is_futures_busy) => {
+                    if s.retries >= s.max_busy_retries {
+                        s.done = true;
+                        let stalled = Error::PagingStalled {
+                            operation: s.operation,
+                            cursor: s.cursor.clone().unwrap_or_default(),
+                            retries: s.retries,
+                            source: e.api().cloned().map(|a| Box::new(a) as _),
+                        };
+                        return Some((Err(stalled), s));
+                    }
+                    (s.wait)(s.retries, e).await;
+                    s.retries += 1;
+                    continue;
+                }
                 Err(e) => {
                     s.done = true;
                     return Some((Err(e), s));
@@ -181,6 +202,7 @@ where
                     operation: s.operation,
                     cursor: next.unwrap_or_default(),
                     retries: s.retries,
+                    source: None,
                 };
                 if s.retries >= s.max_busy_retries {
                     s.done = true;

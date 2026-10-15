@@ -348,9 +348,12 @@ println!("{} open orders, {} fills", orders.orders.len(), fills.len());
 - `fills(cursor)` and `funding(cursor)` return one page. The cursor is opaque: pass `next_cursor` back
   exactly as given. A page can be short, even empty, and still have a `next_cursor`: keep paging until
   it is `None`. `all_fills` / `all_funding` do this for you. When the provider is busy (an empty page
-  whose `next_cursor` is the cursor just sent), they wait with the retry backoff and ask again, at most
-  3 times (`with_max_busy_retries` changes it; the client's `max_retries` does not), then end with
-  `Error::PagingStalled` (code `PAGING_STALLED`, retryable). A page with rows that repeats the cursor just sent
+  whose `next_cursor` is the cursor just sent, or a 503 with `details.reason`
+  `futures_data_unavailable`, also on the first request), they wait (the server's Retry-After, else
+  `details.retry_after_seconds`, as given; else the retry backoff) and ask again, at most 3 times
+  (`with_max_busy_retries` changes it; the client's `max_retries` does not), then end with
+  `Error::PagingStalled` (code `PAGING_STALLED`, retryable; after a 503, its `source()` is that
+  `ApiError`). A page with rows that repeats the cursor just sent
   ends them with `Error::PagingCursorRepeated` (not retryable). Either way, the rows before the error
   are not the whole history.
 
@@ -529,8 +532,8 @@ while let Some(ev) = events.recv().await {
   channels.
 - A refused futures subscribe (`RATE_LIMITED`, `NOT_FOUND`, `VALIDATION_FAILED`,
   `SERVICE_UNAVAILABLE`) is in `SubscribeResult::rejected` like any refused channel (below), and is
-  not retried: WebSocket error frames carry no retry hint, so back off yourself (about 60 s after
-  `RATE_LIMITED`).
+  not retried: back off yourself, using `WsError::retry_after` when the frame has one
+  (`details.retry_after_seconds`; `WsError::channel` and `WsError::details` carry the rest).
 - Public futures sequences are not gap-checked (frames are full replacements, or lost for trades and
   candles); `futures.account` is checked like the other private channels and restarts after a
   re-subscribe.

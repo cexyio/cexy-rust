@@ -9,7 +9,7 @@ use crate::batch::{
     check_place, needs_lookup, new_client_order_id, place_from_result, place_matches, place_result,
 };
 use crate::client::Client;
-use crate::error::{Error, ErrorCategory, Result};
+use crate::error::{ApiError, Error, ErrorCategory, Result};
 use crate::models_gen::*;
 use crate::operations_gen::*;
 use crate::pagination::{HistoryPage, ItemStream, Page, paginate, paginate_history};
@@ -1011,7 +1011,8 @@ fn cancel_all_call(symbol: Option<&str>) -> Result<Call> {
 ///
 /// Every market-data answer carries `as_of` and `stale`. When nothing usable is cached and the
 /// provider cannot be read, the answer is 503 `SERVICE_UNAVAILABLE` (retryable, with
-/// Retry-After), retried by the normal retry policy. Without a futures account, the account
+/// Retry-After), retried by the normal retry policy (the iterate-all helpers treat the
+/// `futures_data_unavailable` 503 as a busy answer instead, see [`Futures::all_fills`]). Without a futures account, the account
 /// reads answer `has_account: false`.
 #[derive(Clone, Copy)]
 pub struct Futures<'a> {
@@ -1107,30 +1108,40 @@ impl<'a> Futures<'a> {
     /// A page can be short, even empty, and still have a `next_cursor`: keep paging until it is
     /// `None`, or use [`Futures::all_fills`].
     pub async fn fills(&self, cursor: Option<&str>) -> Result<FuturesFills> {
+        self.c.get(Self::fills_call(cursor)).await
+    }
+
+    fn fills_call(cursor: Option<&str>) -> Call {
         let p = FuturesFillsParams {
             cursor: cursor.map(str::to_string),
         };
-        self.c
-            .get(Call::new(OperationId::FuturesFills).query(p.query()))
-            .await
+        Call::new(OperationId::FuturesFills).query(p.query())
     }
 
     /// One page of the account's funding payments, newest first; paged like [`Futures::fills`].
     pub async fn funding(&self, cursor: Option<&str>) -> Result<FuturesFunding> {
+        self.c.get(Self::funding_call(cursor)).await
+    }
+
+    fn funding_call(cursor: Option<&str>) -> Call {
         let p = FuturesFundingParams {
             cursor: cursor.map(str::to_string),
         };
-        self.c
-            .get(Call::new(OperationId::FuturesFunding).query(p.query()))
-            .await
+        Call::new(OperationId::FuturesFunding).query(p.query())
     }
 
     /// Every fill (30 days back), newest first, paging until `next_cursor` is `None`.
     ///
-    /// An empty page whose `next_cursor` is the cursor just sent means the provider is busy: the
-    /// SDK waits (its retry backoff) and asks again with the same cursor, at most 3 times in a row
-    /// ([`Futures::with_max_busy_retries`]), then yields [`Error::PagingStalled`] (retryable; the rows
-    /// before it are not the whole history). A page with rows whose `next_cursor` is the cursor just
+    /// The provider is busy when a page is empty and its `next_cursor` is the cursor just sent, or
+    /// when the request gets a 503 with `details.reason` `futures_data_unavailable` (also on the
+    /// first request). The SDK waits (the server's Retry-After, else `details.retry_after_seconds`,
+    /// used as given; else its retry backoff) and asks again with the same cursor, at most 3 times
+    /// in a row ([`Futures::with_max_busy_retries`]; both kinds share the count, an advancing page
+    /// resets it), then yields [`Error::PagingStalled`] (retryable; the rows before it are not the
+    /// whole history; for a 503 it is the error's `source`). The request retries do not apply to
+    /// that 503, so a cursor is asked at most 1 + 3 times whatever `max_retries` is, and a hint
+    /// of up to 30 s from the server means at most about 90 s of waiting. Any other retryable
+    /// error (another 503, a 5xx, a 429) is retried by the request retries. A page with rows whose `next_cursor` is the cursor just
     /// sent yields its rows, then [`Error::PagingCursorRepeated`] (not retryable). Without a futures
     /// account the stream is empty. `max_items` stops the stream after that many items in total.
     pub fn all_fills(&self, max_items: Option<usize>) -> ItemStream<'a, FuturesFill> {
@@ -1139,7 +1150,10 @@ impl<'a> Futures<'a> {
             OperationId::FuturesFills,
             max_items,
             move |cursor| async move {
-                let p = this.fills(cursor.as_deref()).await?;
+                let p: FuturesFills = this
+                    .c
+                    .get(Self::fills_call(cursor.as_deref()).busy_not_retried())
+                    .await?;
                 Ok(HistoryPage {
                     rows: p.fills,
                     has_account: p.has_account,
@@ -1156,7 +1170,10 @@ impl<'a> Futures<'a> {
             OperationId::FuturesFunding,
             max_items,
             move |cursor| async move {
-                let p = this.funding(cursor.as_deref()).await?;
+                let p: FuturesFunding = this
+                    .c
+                    .get(Self::funding_call(cursor.as_deref()).busy_not_retried())
+                    .await?;
                 Ok(HistoryPage {
                     rows: p.funding,
                     has_account: p.has_account,
@@ -1183,7 +1200,13 @@ impl<'a> Futures<'a> {
             self.max_busy_retries,
             max_items,
             fetch,
-            move |attempt, cause| async move { c.t.backoff(op, attempt, &cause, None).await },
+            move |attempt, cause| async move {
+                // A server hint is waited exactly (no jitter); without one, the normal backoff.
+                match cause.api().and_then(ApiError::busy_hint) {
+                    Some(d) => c.t.wait(op, attempt, &cause, None, d).await,
+                    None => c.t.backoff(op, attempt, &cause, None).await,
+                }
+            },
         )
     }
 }
@@ -1198,10 +1221,15 @@ pub(crate) fn clone_error(e: &Error) -> Error {
             operation,
             cursor,
             retries,
+            source,
         } => Error::PagingStalled {
             operation,
             cursor: cursor.clone(),
             retries: *retries,
+            source: source
+                .as_ref()
+                .and_then(|s| s.downcast_ref::<ApiError>())
+                .map(|a| Box::new(a.clone()) as _),
         },
         Error::PagingCursorRepeated { operation, cursor } => Error::PagingCursorRepeated {
             operation,
