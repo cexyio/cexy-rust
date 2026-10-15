@@ -6,6 +6,10 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-dev.15] (2026-10-15)
+
+- Built against cexy-api-spec `0bd25ad` (futures busy 503 paging, WS error `channel`/`details`).
+
 ### Changed
 - `Futures::all_fills` / `all_funding`: a 503 with `details.reason` `futures_data_unavailable` is a
   busy answer, on any request including the first. It shares the `max_busy_retries` count with the
