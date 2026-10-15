@@ -22,7 +22,9 @@ const CANCEL_BATCH: &str = "/api/v1/trading/orders/cancel-batch";
 const BY_CID: &str = "/api/v1/trading/orders/by-client-id/";
 const ORDERS: &str = "/api/v1/trading/orders/";
 /// Per-attempt timeout in these tests; a `network_error` answer is delayed beyond it.
-const TIMEOUT: Duration = Duration::from_millis(150);
+/// It is real time (reqwest), so every other answer must arrive within it: 150 ms was missed
+/// under a loaded parallel `cargo test`, which turned a first attempt into a retry.
+const TIMEOUT: Duration = Duration::from_millis(1000);
 
 /// A client with the limiter on (high enough never to wait unless a test asks) and a short
 /// timeout, on a fake clock.
