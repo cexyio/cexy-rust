@@ -6,6 +6,14 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+- `Trading::cancel_all_until_done`: the retry codes are now exactly `SERVICE_UNAVAILABLE`,
+  `MARKET_UNAVAILABLE` and `CONCURRENT_MODIFICATION` (while `has_more` is also set). `INVALID_STATE`
+  is no longer retried: it is returned in `failures`. Needs backend 94a2735 or later, which cancels a
+  pending order at once; against an older backend a pending order's `INVALID_STATE` returns at once.
+  A market that stays down returns only when the time budget (default 2 min) ends. Texts updated for
+  cancel-at-once.
+
 ## [0.1.0-dev.15] (2026-10-15)
 
 - Built against cexy-api-spec `0bd25ad` (futures busy 503 paging, WS error `channel`/`details`).

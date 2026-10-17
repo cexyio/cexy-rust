@@ -78,11 +78,12 @@ Placing and cancelling need a key with the **trade** scope; everything else need
 Cancel-all also cancels stop orders that have not triggered yet (`pending_trigger`) and releases their
 reservations. One `cancel_all` call handles at most 500 orders. Every order it handled is in exactly one of
 `cancelled`, `already_closed` (it closed on its own first: not a failure) and `failed` (the reason is
-in `failures`; `INVALID_STATE` means the order was still being placed). `has_more` means there are
+in `failures`; `INVALID_STATE` means the order was taken off the book and cannot be cancelled yet; the server cancels a pending order at once). `has_more` means there are
 more. An unknown symbol is a `NotFound` error, and the server allows 30 cancel-all calls a minute.
 
-`cancel_all_until_done` repeats the call until nothing is left: while `has_more` is set or orders are
-still being placed. Each round is exactly one HTTP request (the loop does its own retrying, so it
+`cancel_all_until_done` repeats the call until nothing is left: while `has_more` is set or a failure code is
+`SERVICE_UNAVAILABLE`, `MARKET_UNAVAILABLE` or `CONCURRENT_MODIFICATION`. `INVALID_STATE` is returned,
+not retried. A market that stays down returns only when the time budget ends. Each round is exactly one HTTP request (the loop does its own retrying, so it
 never sends more than `max_rounds` requests). It backs off 1, 2, 4, 8, then 15 s after rounds without
 progress or with a retryable error (a 503, a network failure), waits a 429's `Retry-After` exactly,
 stops after `max_rounds` (default 20) or before a wait would reach `time_budget` (default 120 s; that

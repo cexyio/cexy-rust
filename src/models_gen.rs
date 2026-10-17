@@ -373,7 +373,7 @@ pub struct CancelBatchResult {
 /// Why one order could not be cancelled.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CancelFailure {
-    /// The error code of the attempt, as in any error response: e.g. `INVALID_STATE` for an order still being placed when the wait ran out, or `MARKET_UNAVAILABLE`.
+    /// The error code of the attempt, as in any error response: e.g. `MARKET_UNAVAILABLE` for an order whose market is restarting, or `CONCURRENT_MODIFICATION`.
     pub code: String,
     /// Its message.
     pub message: String,

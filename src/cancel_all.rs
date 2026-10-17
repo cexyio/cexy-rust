@@ -195,8 +195,11 @@ fn error_code(e: &Error) -> String {
 }
 
 impl Trading<'_> {
-    /// Repeats cancel-all until nothing is left to do: while `has_more` is set, or while an
-    /// order failed with `INVALID_STATE` (still being placed) or `SERVICE_UNAVAILABLE`.
+    /// Repeats cancel-all until nothing is left to do: while `has_more` is set, or while a
+    /// failure code is `SERVICE_UNAVAILABLE`, `MARKET_UNAVAILABLE` or `CONCURRENT_MODIFICATION`.
+    /// `INVALID_STATE` (an order taken off the book that cannot be cancelled yet) is returned,
+    /// not retried. A market that stays down returns only when the time budget ends. The server
+    /// cancels a pending order at once.
     ///
     /// Each round is exactly one HTTP request (the transport does not retry inside the loop),
     /// so at most `max_rounds` requests are sent. After a round with no progress (nothing
@@ -263,8 +266,9 @@ impl Trading<'_> {
                     has_more = res.has_more;
                     m.add(&res);
                     let retry = res.failures.iter().any(|f| {
-                        f.code == ErrorCode::InvalidState.as_str()
-                            || f.code == ErrorCode::ServiceUnavailable.as_str()
+                        f.code == ErrorCode::ServiceUnavailable.as_str()
+                            || f.code == ErrorCode::MarketUnavailable.as_str()
+                            || f.code == ErrorCode::ConcurrentModification.as_str()
                     });
                     if !res.has_more && !retry {
                         return Ok(m.summary(round, CancelAllStop::Done, has_more));
