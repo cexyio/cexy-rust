@@ -885,7 +885,8 @@ impl<'a> Trading<'a> {
     ///
     /// One call handles at most 500 orders. Every order it handled is in exactly one of
     /// `cancelled`, `already_closed` (it closed on its own first: not a failure) and `failed`
-    /// (with the reason in `failures`; `INVALID_STATE` means it was still being placed).
+    /// (with the reason in `failures`; `INVALID_STATE` means it was taken off the book and cannot be
+    /// cancelled yet). A pending order is cancelled at once by the server.
     /// `has_more` means there are more: call again, or use [`Trading::cancel_all_until_done`].
     ///
     /// The server limits cancel-all to 30 calls a minute per account (retried after the server's

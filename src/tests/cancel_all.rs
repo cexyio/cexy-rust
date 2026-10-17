@@ -171,7 +171,7 @@ async fn twenty_rounds_with_progress_send_at_most_twenty_requests() {
 #[tokio::test]
 async fn a_429_retry_after_counts_against_the_budget() {
     let stuck = json!({"cancelled": [], "already_closed": [], "failed": ["p1"], "has_more": false,
-                       "failures": [{"order_id": "p1", "code": "INVALID_STATE", "message": "still being placed"}]});
+                       "failures": [{"order_id": "p1", "code": "MARKET_UNAVAILABLE", "message": "market restarting"}]});
     let server = server_with(vec![
         ResponseTemplate::new(429)
             .insert_header("Retry-After", "119")
@@ -198,7 +198,8 @@ async fn a_429_retry_after_counts_against_the_budget() {
 
 #[tokio::test]
 async fn an_order_that_ends_closed_is_never_also_failed() {
-    let pending = |id: &str| json!({"order_id": id, "code": "INVALID_STATE", "message": "still being placed"});
+    let pending =
+        |id: &str| json!({"order_id": id, "code": "CONCURRENT_MODIFICATION", "message": "busy"});
     let server = server_with(vec![
         data(json!({"cancelled": [], "already_closed": [], "failed": ["p1", "p2"], "has_more": false,
                     "failures": [pending("p1"), pending("p2")]})),
@@ -301,7 +302,7 @@ async fn a_rate_limiter_block_counts_against_the_budget() {
     // make the limiter hold the next call for 170 s, past the 120 s budget. The loop must stop
     // instead of calling, without sleeping.
     let stuck = json!({"cancelled": [], "already_closed": [], "failed": ["p1"], "has_more": false,
-                       "failures": [{"order_id": "p1", "code": "INVALID_STATE", "message": "still being placed"}]});
+                       "failures": [{"order_id": "p1", "code": "MARKET_UNAVAILABLE", "message": "market restarting"}]});
     let server = server_with(vec![
         data(stuck)
             .insert_header("X-RateLimit-Limit", "30")
@@ -319,4 +320,46 @@ async fn a_rate_limiter_block_counts_against_the_budget() {
     assert_eq!(r.last_error_code.as_deref(), Some("RATE_LIMITED"));
     assert_eq!(server.received_requests().await.unwrap().len(), 1);
     assert!(clock.sleeps().iter().sum::<Duration>() < Duration::from_secs(120));
+}
+
+fn failed_with(code: &str) -> Value {
+    json!({"cancelled": [], "already_closed": [], "failed": ["p1"], "has_more": false,
+           "failures": [{"order_id": "p1", "code": code, "message": "m"}]})
+}
+
+#[tokio::test]
+async fn invalid_state_is_returned_not_retried() {
+    let server = server_with(vec![data(failed_with("INVALID_STATE"))]).await;
+    let (c, clock) = client(&server);
+    let r = c
+        .trading()
+        .cancel_all_until_done(&CancelAllOptions::symbol("BTC/USDT"))
+        .await
+        .unwrap();
+    assert_eq!((r.rounds, r.stopped), (1, CancelAllStop::Done));
+    assert_eq!(r.failed, vec!["p1"]);
+    assert_eq!(r.failures[0].code, "INVALID_STATE");
+    assert!(clock.sleeps().is_empty());
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn market_unavailable_and_concurrent_modification_retry_then_resolve() {
+    for code in ["MARKET_UNAVAILABLE", "CONCURRENT_MODIFICATION"] {
+        let server = server_with(vec![
+            data(failed_with(code)),
+            data(json!({"cancelled": ["p1"], "already_closed": [], "failed": [], "failures": [], "has_more": false})),
+        ])
+        .await;
+        let (c, clock) = client(&server);
+        let r = c
+            .trading()
+            .cancel_all_until_done(&CancelAllOptions::symbol("BTC/USDT"))
+            .await
+            .unwrap();
+        assert_eq!((r.rounds, r.stopped), (2, CancelAllStop::Done), "{code}");
+        assert_eq!(r.cancelled, vec!["p1"], "{code}");
+        assert!(r.failed.is_empty(), "{code}");
+        assert_eq!(clock.sleeps(), vec![Duration::from_secs(1)], "{code}");
+    }
 }
